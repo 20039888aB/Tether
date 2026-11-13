@@ -1,0 +1,13 @@
+.venv/
+**/.venv/
+**/__pycache__/
+**/.pytest_cache/
+**/.ruff_cache/
+**/*.egg-info/
+**/.coverage
+**/*.py[cod]
+**/node_modules/
+**/dist/
+**/.env
+**/.env.*
+!**/.env.example
