@@ -1,29 +1,32 @@
-# CareGrid HMS — Current State and Improvement Report
+# TETHER — Current State and Improvement Report
 
-**Assessment date:** 13 November 2026  
+**Assessment date:** 16 November 2026
 **Repository:** [20039888aB/Tether](https://github.com/20039888aB/Tether)  
-**Branch and revision assessed:** `main` at `9bfe5d8483215e381fa6b3e695b6ed911637b418`  
+**Branch and revision assessed:** `main` at `14eaff8f129831d86a88326519fa6c75bc8b92dc`
 **Overall maturity:** Early development foundation / demonstrator — **not a hospital-ready system**
 
 ## Executive summary
 
-The repository is a greenfield starter with a useful first visual prototype and the start of an API foundation. The frontend captures several recognizable elements of the supplied references—grouped navigation, dense operational tables, queue statuses, summary cards, search, filters, and pagination. The backend has initial account/session models, login and permission-checking routes, health checks, a PostgreSQL schema, and an administrator-bootstrap script.
+The repository is an early development system with an identity/authorization foundation and one persisted operational slice. The frontend authenticates against the API, filters navigation by permission, provides SuperAdmin role/permission and user administration with an audit viewer, and connects patient registration and the OPD queue to the backend.
 
-The current frontend queue is sample data held in the browser. The frontend does not authenticate against the API, read or write persistent records, or receive real-time events. The SQL migration has not been applied to PostgreSQL in this workspace. There are no patient registration, clinical, admissions, billing, payment, pharmacy, accounting, or HR workflows behind the navigation.
+The patient and OPD slice supports synthetic patient registration, search, update, likely-duplicate rejection, and persistent queued visits. Other navigation modules remain placeholders; there are no clinical, admissions, billing, payment, pharmacy, accounting, or HR workflows. SQLite is the development database; PostgreSQL migrations have not been applied or verified.
 
-**Conclusion:** This is a credible prototype foundation, but it is not safe or complete for clinical use, financial processing, real patient data, or production/on-premises deployment. Prioritize a verified database setup and secure, authenticated end-to-end patient-registration slice before adding broad module coverage.
+**Conclusion:** This is not a hospital-ready system. Do not use it for clinical care, financial processing, real patient data, or production deployment. Continue with stakeholder-reviewed workflows, production database migrations, and security/privacy hardening before expanding module coverage.
 
 ## Evidence and scope
 
-This assessment is based on the checked-out project files, the latest frontend build and lint, the backend test and lint runs, and the known workspace capability to run a production frontend build. The current branch was clean at the assessed revision.
+This assessment is based on the checked-out project files, frontend build and lint, backend tests and lint, SQLite role seeding, and direct API/CORS health checks. The worktree contains uncommitted changes; the new patient screens have not been browser-verified.
 
 Verification performed:
 
-- Backend: **5 tests passed**; Ruff lint passed.
-- Frontend: TypeScript/Vite production build passed; oxlint passed.
-- The frontend build emits a **large JavaScript bundle warning** (about 972 kB uncompressed, 306 kB gzip).
+- Backend: **19 tests passed**; Ruff lint passed.
+- Frontend: TypeScript/Vite production build passed; oxlint completed with four React set-state-in-effect warnings.
+- The frontend build emits a **large JavaScript bundle warning** (about 1.05 MB uncompressed, 328 kB gzip).
 - The test environment emits one Starlette/AnyIO deprecation warning.
-- PostgreSQL migration execution and live database readiness were **not** verified. PostgreSQL client/server tools were not available during this assessment.
+- SQLite seeding created 33 roles and 410 catalog permissions.
+- SQLite migration marked the sole active SuperAdmin as the designated system owner and created a unique owner index.
+- Both development servers responded successfully; readiness and CORS checks passed. After refreshing, the shared browser displayed the patient queue and registration form without a fetch error.
+- PostgreSQL migration execution and readiness were **not** verified.
 
 This is a current-state engineering assessment, not an independent penetration test, code certification, clinical safety review, performance benchmark, legal opinion, or compliance attestation.
 
@@ -31,22 +34,22 @@ This is a current-state engineering assessment, not an independent penetration t
 
 | Area | Present now | Not yet present / limitation |
 |---|---|---|
-| Frontend | React + TypeScript + Ant Design shell; collapsible grouped navigation; synthetic patient-queue rows; status badges, search/status filter, sorting, and table pagination; responsive sidebar behavior. | No login screen or authenticated API client. Navigation selections mostly change the page heading rather than render functional modules. Queue metrics, status, and data are hard-coded; no real calendar, registration form, patient profile, or live queue. |
-| API | FastAPI application; OpenAPI in development; liveness and readiness endpoints; versioned auth routes. | No patient or clinical endpoints, API integration with the frontend, production hosting configuration, application-wide rate limiting, or durable event/notification delivery. |
-| Authentication | Argon2 password verification; opaque random server-side sessions; hashed session and CSRF tokens; HttpOnly session cookie; CSRF validation for protected state-changing actions; account lockout counter; generic login error; login/session audit attempts. | No MFA, identity-provider/OIDC integration, password reset/change, account-management API, session-management UI, configurable password policy, or comprehensive abuse controls. |
-| Authorization | Role/permission tables; permission guard on the sample user-list API; seeded role permissions in SQL. | No facility/department/patient-context ABAC, permission-aware frontend, role administration interface/API, broad authorization tests, or review of the final clinical and finance permission matrix. UI hiding is not authorization. |
-| Database | PostgreSQL-oriented SQL migration for roles, permissions, users, sessions, and audit logs. SQLAlchemy models can support SQLite-based tests. | Migration is not part of a migration-runner/version table workflow; no PostgreSQL instance or migration verification; no database deployment, backups, restore drills, data retention, or operational monitoring. |
-| Audit | Audit table, indexes, application-level identity/session audit events, and a database trigger rejecting audit-row update/delete. | Audit covers only identity-related routes, not patient record access, exports, clinical activity, financial actions, system administration, or integrations. No append-only database-role design, tamper-evident external copy, audit viewer, or retention policy. |
+| Frontend | React + TypeScript + Ant Design; authenticated login/logout; permission-filtered navigation; owner-protected SuperAdmin/user/role/permission administration; audit viewer; patient registration/search/edit and queued OPD visit screens. | Clinical, admissions, diagnostics, billing, pharmacy, accounting, inventory, HR, reports, and real-time events remain placeholders. Registration and OPD screens loaded in the browser; end-to-end create/edit flows have not been browser-exercised. |
+| API | FastAPI; liveness/readiness; versioned identity and patient-access routes; server-side permission guards; patient search/registration/update; OPD visit creation/queue reads. | No clinical endpoints, application-wide rate limiting, appointment scheduling, queue transitions, or durable event/notification delivery. |
+| Authentication | Argon2 verification; opaque random server-side sessions; hashed session and CSRF tokens; HttpOnly session cookie; CSRF validation; account lockout; audited password resets and session revocation. The designated system owner is stored in the database, has backend SuperAdmin bypass, and cannot be deactivated or demoted through application APIs. A trusted-host CLI recovery resets the owner password/lockout and revokes sessions. | No MFA, identity-provider/OIDC integration, web-based self-service recovery, session-management UI, or comprehensive abuse controls. Temporary login lockout still applies until the owner uses the local recovery command. |
+| Authorization | 33 seeded roles; 410 catalog permissions; server-side identity and patient-access guards; SuperAdmin role/permission CRUD and individual allow/deny overrides; deny-over-role precedence; cashier/refund-approver separation. Owner access is immutable and independent of role permission rows. | No facility/department/patient-context ABAC. Most operational permissions remain catalog entries with no domain API. Additional separation-of-duties policies require local approval. |
+| Database | SQLite development database configured and seeded; SQLAlchemy patient, OPD, identity, and audit models. | PostgreSQL migrations are not part of a verified migration-runner workflow; no PostgreSQL deployment, backups, restore drills, data retention, or operational monitoring. |
+| Audit | Authentication, identity/role/permission administration, patient search/read/register/update, and OPD visit creation are audited; audit reads are logged. The PostgreSQL initial migration defines an audit mutation-rejecting trigger. | No clinical/financial audit events, external tamper-evident copy, retention policy, or equivalent verified SQLite immutability trigger. |
 | Integrations/realtime | Product direction is documented. | No SMS/voice, mobile-money/payment, insurance, lab, FHIR/DICOM, event bus, WebSocket, webhook, retry, or reconciliation implementation. |
 | Deployment | Development setup notes and an environment example. | No Dockerfile, Compose stack, TLS termination, secrets/key management, supported deployment/upgrade sequence, monitoring, recovery plan, or production runbook. |
 
 ## Important safety and security gaps
 
-1. **The UI currently exposes demo records without authentication.** They are synthetic, but the eventual patient-facing views must require authenticated server authorization. Do not populate this UI with real data.
+1. **The patient workflow is a limited development slice.** It stores basic demographics and queued OPD visits, but has no patient merge/history, appointments, triage, clinical documentation, or approved real-world registration policy. Use synthetic data only.
 2. **There is no medical-record access-control model.** A role name alone is not enough; patient context, facility/department scope, care relationship, purpose, and emergency access rules may need to affect authorization.
 3. **Account lockout is not a complete abuse defense.** Per-account limits can be abused to deny service to a known user, and there is no centralized IP/device rate limiting, alerting, MFA, or account recovery flow.
-4. **No production-grade identity policy is established.** Session rotation/limits, revocation of all active sessions, idle timeout, MFA for privileged access, password changes, secure recovery, and deployment cookie/proxy behavior need definition and tests.
-5. **The audit claim must stay narrow.** The schema blocks updates and deletes with a trigger, but database owners can change schema or bypass ordinary application controls. It does not independently prove immutability or detect privileged tampering.
+4. **No production-grade identity policy is established.** Session limits, idle timeout, MFA for privileged access, self-service recovery, and deployment cookie/proxy behavior need definition and tests. Admin password resets are not a complete account-recovery flow.
+5. **The audit claim must stay narrow.** Identity and the initial patient-access slice are audited, but there are no clinical/financial events. The PostgreSQL schema trigger is not an external tamper-evident copy and does not detect privileged tampering; SQLite immutability is not verified.
 6. **Production operational security is missing.** Encryption at rest/backups, key ownership and rotation, TLS, firewall/network segmentation, patch/vulnerability management, monitoring, least-privilege database credentials, backups, and tested restoration are not implemented or verified.
 7. **No local legal/privacy assessment has been completed.** Obtain qualified review for Kenyan health data, privacy, retention, consent, patient rights, and external data processing before real deployment.
 8. **Payment and clinical safety controls do not yet exist.** Do not handle real payments, prescriptions, care decisions, or treatment documentation with this starter.
@@ -67,24 +70,24 @@ This is a current-state engineering assessment, not an independent penetration t
 ### P1 — Complete secure identity and permission foundation
 
 - Decide and document the identity/session threat model, MFA policy, session lifetimes, account recovery, privileged-user controls, and emergency access approach.
-- Add administrator-controlled user/role/permission management with last-admin protections and audit coverage. Never use public signup or default credentials.
+- Last-active-SuperAdmin protection and SuperAdmin-only policy changes are implemented. Add secure self-service recovery/password change, confirmation for high-impact actions, and additional privileged-account safeguards.
 - Add database-backed, configurable rate limiting and monitoring for login attempts; assess lockout denial-of-service trade-offs.
-- Test unauthorized, expired, revoked, inactive, cross-role, CSRF, account-lock, and permission-change scenarios; verify sensitive actions are audited.
-- Add API client authentication to the frontend, logout, session-expiry handling, an access-denied state, and permission-aware navigation as a UX layer. Server checks remain authoritative.
-- Extend audit coverage to successful/denied access of sensitive records, exports, administrative changes, and later clinical and financial events. Define audit access, retention, external forwarding, and tamper response.
+- Expand tests for expired sessions, concurrency, and policy edge cases; existing coverage includes permission overrides, CSRF, lockout, password reset/session revocation, audit access, last-SuperAdmin protection, role changes, and separation of duties.
+- Add session-expiry handling and an access-denied state. Frontend login/logout and permission-aware navigation exist as UX layers; server checks remain authoritative.
+- Extend audit coverage to sensitive-record access, exports, and future clinical/financial events. Define retention, external forwarding, and tamper response.
 
 **Acceptance gate:** documented role/permission matrix and automated evidence that every protected sample API denies unauthorized requests; authentication flows work end-to-end in the UI.
 
-### P2 — Build the first real vertical slice: reception and patient access
+### P2 — Complete the reception and patient-access slice
 
 - Confirm patient registration fields, locally required identifiers, consent, demographics, contact/next-of-kin details, payer model, duplicate-resolution policy, and access scope with clinical/operations stakeholders.
-- Model patient, contact/next-of-kin, consent, payer/coverage, visit, appointment, clinic, and queue state with constraints and indexed search; define patient-number generation and merge history.
-- Implement patient search, registration, duplicate review, view/edit permissions, appointment/check-in, and auditable queue transitions through versioned APIs and PostgreSQL transactions.
+- The current SQLite slice models basic patient demographics and linked queued visits, uses generated patient/visit identifiers, and audits patient access and changes. Extend only after stakeholders approve fields and duplicate policy.
+- Implement patient merge/history, contact/next-of-kin, consent, payer/coverage, appointment scheduling, check-in, and auditable queue transitions through versioned APIs and verified PostgreSQL transactions.
 - Define allowed queue transitions server-side and record the actor/time/reason; add synthetic-data fixtures only.
-- Connect the UI to the API, add form validation and clear loading/error/empty states, and verify keyboard/accessible behavior.
-- Add duplicate, validation, authorization, concurrency, pagination, sorting/filter, audit, and end-to-end tests.
+- Connect remaining workflow screens to the API; the initial registration/search/edit and queue screens now have loading/error/empty states but need browser/accessibility verification.
+- Add concurrency, patient-merge, transition, pagination, and broader end-to-end tests; current backend tests cover registration, duplicate conflict, update, queue linkage, audit, and unauthorized access.
 
-**Acceptance gate:** a receptionist can register a synthetic patient, find/review a possible duplicate, create/check in a visit, and move it through an approved queue transition with correct permissions and audit events.
+**Acceptance gate:** a receptionist can register and find synthetic patients, resolve duplicates through an approved review process, and move visits through stakeholder-approved queue transitions with correct permissions and audit events.
 
 ### P3 — Establish clinical safety before clinical features
 
@@ -138,7 +141,7 @@ This is a current-state engineering assessment, not an independent penetration t
 
 ## Recommended immediate next milestone
 
-Complete **P0 foundation**, then implement **P1 identity with UI integration**, followed by the **P2 reception/patient registration vertical slice**. Do not start payments, clinical notes, real messaging, or production data until their distinct safety, privacy, audit, and operational controls have been designed and verified.
+Complete remaining **P1 identity hardening** and browser-verify the **P2 patient registration/OPD slice**. Then stage the remaining modules with clinical, privacy, security, and operational review. Do not use production patient data, payments, clinical notes, or messaging until their distinct safety, privacy, audit, and operational controls have been designed and verified.
 
 ## Project links
 
@@ -146,4 +149,4 @@ Complete **P0 foundation**, then implement **P1 identity with UI integration**, 
 - [Authentication endpoints](./backend/app/api/auth.py)
 - [Core PostgreSQL migration](./backend/migrations/001_core.sql)
 - [Backend tests](./backend/tests)
-- [Frontend shell and synthetic queue](./frontend/src/App.tsx)
+- [Frontend shell and patient access screens](./frontend/src/App.tsx)

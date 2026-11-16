@@ -13,11 +13,15 @@ from app.core.config import get_settings
 
 
 @lru_cache
+def _create_engine(database_url: str) -> AsyncEngine:
+    return create_async_engine(database_url, pool_pre_ping=True)
+
+
 def get_engine() -> AsyncEngine | None:
     database_url = get_settings().database_url
     if not database_url:
         return None
-    return create_async_engine(database_url, pool_pre_ping=True)
+    return _create_engine(database_url)
 
 
 async def get_db() -> AsyncIterator[AsyncSession]:

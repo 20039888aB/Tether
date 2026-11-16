@@ -6,6 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.auth import router as auth_router
 from app.api.health import router as health_router
+from app.api.patient_access import router as patient_access_router
 from app.core.config import get_settings
 from app.db.session import get_engine
 
@@ -22,7 +23,7 @@ async def lifespan(_: FastAPI):
 
 settings = get_settings()
 app = FastAPI(
-    title="CareGrid HMS API",
+    title="TETHER API",
     version="0.1.0",
     description="API foundation for a modular hospital management system.",
     lifespan=lifespan,
@@ -39,3 +40,4 @@ app.add_middleware(
 )
 app.include_router(health_router, prefix="/api/v1")
 app.include_router(auth_router, prefix="/api/v1")
+app.include_router(patient_access_router, prefix="/api/v1")

@@ -1,11 +1,10 @@
 import { useEffect, useMemo, useState } from 'react'
+import type { ReactNode } from 'react'
 import {
   AppstoreOutlined,
   AuditOutlined,
   BellOutlined,
   CalendarOutlined,
-  CheckCircleOutlined,
-  ClockCircleOutlined,
   DollarOutlined,
   FileSearchOutlined,
   HeartOutlined,
@@ -13,14 +12,12 @@ import {
   MedicineBoxOutlined,
   MenuFoldOutlined,
   MenuUnfoldOutlined,
-  PlusOutlined,
-  SearchOutlined,
   SettingOutlined,
   TeamOutlined,
   UserAddOutlined,
-  UserOutlined,
 } from '@ant-design/icons'
 import {
+  Alert,
   Avatar,
   Badge,
   Button,
@@ -30,78 +27,71 @@ import {
   Input,
   Layout,
   Menu,
-  Select,
   Space,
-  Statistic,
-  Table,
-  Tag,
   Typography,
 } from 'antd'
-import type { MenuProps, TableColumnsType } from 'antd'
+import type { MenuProps } from 'antd'
+import AdminConsole from './AdminConsole'
+import { apiRequest } from './api'
+import PatientAccess from './PatientAccess'
+import type { AuthUser } from './api'
 import './App.css'
 
 const { Header, Sider, Content } = Layout
 const { Text, Title } = Typography
+const CSRF_COOKIE_NAME = import.meta.env.VITE_CSRF_COOKIE_NAME ?? 'tether_csrf'
 
-type QueuePatient = {
+type NavigationLink = {
   key: string
-  name: string
-  patientNumber: string
-  visitNumber: string
-  clinic: string
-  visitType: string
-  queuedAt: string
-  waitMinutes: number
-  status: 'Queued' | 'Triaged' | 'With nurse' | 'With doctor'
-  assignedTo: string
+  icon: ReactNode
+  label: string
+  permissions: string[]
 }
 
-const queuePatients: QueuePatient[] = [
-  { key: '1', name: 'Amina Njeri', patientNumber: 'HMS-004821', visitNumber: 'V-2026-0136', clinic: 'Outpatient', visitType: 'Consultation', queuedAt: '08:42', waitMinutes: 34, status: 'With nurse', assignedTo: 'N. Kamau' },
-  { key: '2', name: 'Brian Otieno', patientNumber: 'HMS-004820', visitNumber: 'V-2026-0135', clinic: 'Paediatrics', visitType: 'Review', queuedAt: '08:51', waitMinutes: 25, status: 'Triaged', assignedTo: '—' },
-  { key: '3', name: 'Wanjiku Mwangi', patientNumber: 'HMS-004819', visitNumber: 'V-2026-0134', clinic: 'General practice', visitType: 'Consultation', queuedAt: '09:03', waitMinutes: 13, status: 'Queued', assignedTo: '—' },
-  { key: '4', name: 'David Kiptoo', patientNumber: 'HMS-004818', visitNumber: 'V-2026-0133', clinic: 'Dental', visitType: 'New visit', queuedAt: '09:06', waitMinutes: 10, status: 'With doctor', assignedTo: 'Dr. M. Wekesa' },
-  { key: '5', name: 'Grace Achieng', patientNumber: 'HMS-004817', visitNumber: 'V-2026-0132', clinic: 'Outpatient', visitType: 'Consultation', queuedAt: '09:12', waitMinutes: 4, status: 'Queued', assignedTo: '—' },
-  { key: '6', name: 'Peter Maina', patientNumber: 'HMS-004816', visitNumber: 'V-2026-0131', clinic: 'Antenatal care', visitType: 'Follow-up', queuedAt: '09:14', waitMinutes: 2, status: 'Triaged', assignedTo: '—' },
-]
+type NavigationSection = {
+  label?: string
+  items: NavigationLink[]
+}
 
-const navigation: MenuProps['items'] = [
-  { key: 'overview', icon: <AppstoreOutlined />, label: 'Overview' },
+const navigationSections: NavigationSection[] = [
   {
-    key: 'patients-group',
-    type: 'group',
+    items: [
+      {
+        key: 'overview',
+        icon: <AppstoreOutlined />,
+        label: 'Overview',
+        permissions: ['administration.operational-dashboards-and-reports.view'],
+      },
+    ],
+  },
+  {
     label: 'PATIENT ACCESS',
-    children: [
-      { key: 'patient-register', icon: <UserAddOutlined />, label: 'Patient register' },
-      { key: 'patient-queue', icon: <TeamOutlined />, label: 'Patient queue' },
-      { key: 'appointments', icon: <CalendarOutlined />, label: 'Appointments' },
-      { key: 'admissions', icon: <HomeOutlined />, label: 'Admissions' },
+    items: [
+      { key: 'patient-register', icon: <UserAddOutlined />, label: 'Patient register', permissions: ['front-office.patient-registration-and-biodata.view'] },
+      { key: 'patient-queue', icon: <TeamOutlined />, label: 'Patient queue', permissions: ['front-office.open-outpatient-visit.view'] },
+      { key: 'appointments', icon: <CalendarOutlined />, label: 'Appointments', permissions: ['front-office.appointment-scheduling.view', 'patient-services.request-appointments-update-contact-details.view'] },
+      { key: 'admissions', icon: <HomeOutlined />, label: 'Admissions', permissions: ['clinical.admission-transfer-and-discharge-orders.view'] },
     ],
   },
   {
-    key: 'care-group',
-    type: 'group',
     label: 'CARE DELIVERY',
-    children: [
-      { key: 'nursing', icon: <HeartOutlined />, label: 'Nursing' },
-      { key: 'doctors', icon: <MedicineBoxOutlined />, label: 'Doctors' },
-      { key: 'diagnostics', icon: <FileSearchOutlined />, label: 'Laboratory & imaging' },
-      { key: 'wards', icon: <HomeOutlined />, label: 'Ward management' },
-      { key: 'pharmacy', icon: <MedicineBoxOutlined />, label: 'Pharmacy & stock' },
+    items: [
+      { key: 'nursing', icon: <HeartOutlined />, label: 'Nursing', permissions: ['nursing.triage-and-vital-signs.view', 'nursing.nursing-notes-and-care-plans.view'] },
+      { key: 'doctors', icon: <MedicineBoxOutlined />, label: 'Doctors', permissions: ['clinical.consultation-notes-and-examination.view'] },
+      { key: 'diagnostics', icon: <FileSearchOutlined />, label: 'Laboratory & imaging', permissions: ['laboratory.laboratory-requests-and-worklists.view', 'radiology.imaging-requests-and-schedule.view'] },
+      { key: 'wards', icon: <HomeOutlined />, label: 'Ward management', permissions: ['nursing.ward-observations-and-fluid-charts.view', 'nursing.nursing-documentation-review.view'] },
+      { key: 'pharmacy', icon: <MedicineBoxOutlined />, label: 'Pharmacy & stock', permissions: ['pharmacy.view-prescriptions.view', 'pharmacy.medication-stock-and-batch-records.view'] },
     ],
   },
   {
-    key: 'operations-group',
-    type: 'group',
     label: 'OPERATIONS',
-    children: [
-      { key: 'billing', icon: <DollarOutlined />, label: 'Billing & cashier' },
-      { key: 'accounting', icon: <AuditOutlined />, label: 'Accounting' },
-      { key: 'people', icon: <TeamOutlined />, label: 'Staff & rosters' },
-      { key: 'reports', icon: <FileSearchOutlined />, label: 'Reports' },
+    items: [
+      { key: 'billing', icon: <DollarOutlined />, label: 'Billing & cashier', permissions: ['billing.view-patient-charges-and-account.view', 'cash-office.receive-cash-m-pesa-card-payments.view'] },
+      { key: 'accounting', icon: <AuditOutlined />, label: 'Accounting', permissions: ['accounts.view-financial-transactions-and-reports.view'] },
+      { key: 'people', icon: <TeamOutlined />, label: 'Staff & rosters', permissions: ['human-resources.staff-records-and-employment-details.view'] },
+      { key: 'reports', icon: <FileSearchOutlined />, label: 'Reports', permissions: ['medical-records.medical-statistics-and-records-reports.view', 'quality-audit.quality-indicators-and-incident-reports.view', 'quality-audit.read-only-audit-trail-and-transaction-reports.view'] },
     ],
   },
-  { key: 'settings', icon: <SettingOutlined />, label: 'Administration' },
 ]
 
 const menuLabels = new Map<string, string>([
@@ -119,27 +109,91 @@ const menuLabels = new Map<string, string>([
   ['accounting', 'Accounting'],
   ['people', 'Staff & rosters'],
   ['reports', 'Reports'],
-  ['settings', 'Administration'],
+  ['settings', 'Administration & audit'],
 ])
 
-function statusColor(status: QueuePatient['status']) {
-  switch (status) {
-    case 'Queued':
-      return 'default'
-    case 'Triaged':
-      return 'gold'
-    case 'With nurse':
-      return 'blue'
-    case 'With doctor':
-      return 'green'
+function hasPermission(user: AuthUser, permissionKeys: string[]) {
+  return permissionKeys.some((permission) => user.permissions.includes(permission))
+}
+
+function canOpenNavigationKey(user: AuthUser, key: string) {
+  if (key === 'settings') {
+    return hasPermission(user, [
+      'identity.users.manage',
+      'identity.roles.manage',
+      'quality-audit.read-only-audit-trail-and-transaction-reports.view',
+    ])
   }
+  return navigationSections
+    .flatMap((section) => section.items)
+    .some((item) => item.key === key && hasPermission(user, item.permissions))
+}
+
+function buildNavigation(user: AuthUser): MenuProps['items'] {
+  const items: NonNullable<MenuProps['items']> = []
+  for (const section of navigationSections) {
+    const links = section.items
+      .filter((item) => hasPermission(user, item.permissions))
+      .map(({ key, icon, label }) => ({ key, icon, label }))
+    if (section.label && links.length) {
+      items.push({ type: 'group', label: section.label, children: links })
+    } else {
+      items.push(...links)
+    }
+  }
+  if (canOpenNavigationKey(user, 'settings')) {
+    items.push({ key: 'settings', icon: <SettingOutlined />, label: 'Administration & audit' })
+  }
+  return items
+}
+
+function defaultNavigationKey(user: AuthUser) {
+  if (canOpenNavigationKey(user, 'patient-queue')) return 'patient-queue'
+  if (canOpenNavigationKey(user, 'settings')) return 'settings'
+  return navigationSections
+    .flatMap((section) => section.items)
+    .find((item) => hasPermission(user, item.permissions))?.key ?? 'no-access'
+}
+
+function readCsrfCookie() {
+  const cookie = document.cookie
+    .split('; ')
+    .find((entry) => entry.startsWith(`${CSRF_COOKIE_NAME}=`))
+  return cookie ? decodeURIComponent(cookie.slice(CSRF_COOKIE_NAME.length + 1)) : ''
 }
 
 function App() {
   const [collapsed, setCollapsed] = useState(() => window.innerWidth < 992)
   const [selectedKey, setSelectedKey] = useState('patient-queue')
-  const [query, setQuery] = useState('')
-  const [statusFilter, setStatusFilter] = useState<string>('all')
+  const [authUser, setAuthUser] = useState<AuthUser | null>(null)
+  const [authLoading, setAuthLoading] = useState(true)
+  const [csrfToken, setCsrfToken] = useState('')
+  const [loginError, setLoginError] = useState('')
+  const [loginState, setLoginState] = useState({ username: '', password: '' })
+  const [submitting, setSubmitting] = useState(false)
+  const navigationItems = useMemo(
+    () => (authUser ? buildNavigation(authUser) : []),
+    [authUser],
+  )
+
+  const loadCurrentUser = async () => {
+    try {
+      const user = await apiRequest<AuthUser>('/auth/me')
+      setAuthUser(user)
+      setCsrfToken(readCsrfCookie())
+      setLoginError('')
+    } catch (error) {
+      setAuthUser(null)
+      setCsrfToken('')
+      setLoginError(
+        error instanceof Error && error.message !== 'authentication_required'
+          ? error.message
+          : '',
+      )
+    } finally {
+      setAuthLoading(false)
+    }
+  }
 
   useEffect(() => {
     const updateSidebar = () => setCollapsed(window.innerWidth < 992)
@@ -147,89 +201,133 @@ function App() {
     return () => window.removeEventListener('resize', updateSidebar)
   }, [])
 
-  const filteredPatients = useMemo(() => queuePatients.filter((patient) => {
-    const matchesQuery = `${patient.name} ${patient.patientNumber} ${patient.visitNumber} ${patient.clinic}`
-      .toLowerCase()
-      .includes(query.toLowerCase())
-    return matchesQuery && (statusFilter === 'all' || patient.status === statusFilter)
-  }), [query, statusFilter])
+  useEffect(() => {
+    void loadCurrentUser()
+  }, [])
 
-  const columns: TableColumnsType<QueuePatient> = [
-    {
-      title: 'PATIENT',
-      dataIndex: 'name',
-      key: 'patient',
-      width: 250,
-      render: (_, patient) => (
-        <Space size={12}>
-          <Avatar className="patient-avatar" icon={<UserOutlined />} />
-          <span className="patient-cell">
-            <Text strong>{patient.name}</Text>
-            <Text type="secondary">{patient.patientNumber}</Text>
-          </span>
-        </Space>
-      ),
-    },
-    { title: 'VISIT NO.', dataIndex: 'visitNumber', key: 'visitNumber', width: 150 },
-    {
-      title: 'CLINIC / VISIT',
-      key: 'clinic',
-      width: 220,
-      render: (_, patient) => (
-        <span className="patient-cell">
-          <Text>{patient.clinic}</Text>
-          <Text type="secondary">{patient.visitType}</Text>
-        </span>
-      ),
-    },
-    {
-      title: 'QUEUE TIME',
-      dataIndex: 'queuedAt',
-      key: 'queuedAt',
-      width: 140,
-      sorter: (left, right) => left.queuedAt.localeCompare(right.queuedAt),
-    },
-    {
-      title: 'WAIT',
-      dataIndex: 'waitMinutes',
-      key: 'waitMinutes',
-      width: 120,
-      sorter: (left, right) => left.waitMinutes - right.waitMinutes,
-      render: (minutes: number) => (
-        <Space size={6} className={minutes >= 30 ? 'wait-long' : 'wait-normal'}>
-          <ClockCircleOutlined />
-          <Text>{minutes} min</Text>
-        </Space>
-      ),
-    },
-    {
-      title: 'STATUS',
-      dataIndex: 'status',
-      key: 'status',
-      width: 160,
-      render: (status: QueuePatient['status']) => (
-        <Tag color={statusColor(status)} className="status-tag">{status}</Tag>
-      ),
-    },
-    { title: 'ASSIGNED TO', dataIndex: 'assignedTo', key: 'assignedTo', width: 170 },
-    {
-      title: '',
-      key: 'action',
-      width: 110,
-      align: 'right',
-      render: (_, patient) => (
-        <Button type="link" onClick={() => setSelectedKey('patient-queue')} aria-label={`Open ${patient.name}`}>
-          Open
-        </Button>
-      ),
-    },
-  ]
+  useEffect(() => {
+    if (authUser && !canOpenNavigationKey(authUser, selectedKey)) {
+      setSelectedKey(defaultNavigationKey(authUser))
+    }
+  }, [authUser, selectedKey])
+
+  const handleLogin = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+    setSubmitting(true)
+    setLoginError('')
+
+    try {
+      const response = await apiRequest<{ csrf_token: string }>('/auth/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          username: loginState.username,
+          password: loginState.password,
+        }),
+      })
+
+      setCsrfToken(response.csrf_token)
+      await loadCurrentUser()
+    } catch (error) {
+      setLoginError(error instanceof Error ? error.message : 'Unable to sign in.')
+      setAuthUser(null)
+    } finally {
+      setSubmitting(false)
+    }
+  }
+
+  const handleLogout = async () => {
+    if (!csrfToken) {
+      setAuthUser(null)
+      return
+    }
+
+    try {
+      await apiRequest('/auth/logout', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-CSRF-Token': csrfToken,
+        },
+      })
+    } catch {
+      // ignore the logout response failure and clear the session in the UI
+    } finally {
+      setAuthUser(null)
+      setCsrfToken('')
+      setLoginState({ username: '', password: '' })
+    }
+  }
 
   const userMenu: MenuProps = {
     items: [
       { key: 'profile', label: 'My profile' },
-      { key: 'signout', label: 'Sign out', disabled: true },
+      { key: 'signout', label: 'Sign out', onClick: handleLogout },
     ],
+  }
+
+  if (authLoading) {
+    return (
+      <div className="auth-shell">
+        <Card className="auth-card">
+          <Title level={3}>Loading TETHER...</Title>
+        </Card>
+      </div>
+    )
+  }
+
+  if (!authUser) {
+    return (
+      <div className="auth-shell">
+        <Card className="auth-card">
+          <div className="auth-brand">
+            <div className="brand-mark auth-brand-mark"><HeartOutlined /></div>
+            <div>
+              <Text className="eyebrow auth-eyebrow">SECURE ACCESS</Text>
+              <Title level={2}>TETHER</Title>
+            </div>
+          </div>
+
+          <Text type="secondary">Sign in with your hospital account to access the queue and patient workflows.</Text>
+
+          {loginError && (
+            <Alert className="auth-alert" type="error" showIcon title={loginError} />
+          )}
+
+          <form onSubmit={handleLogin} className="auth-form">
+            <label className="auth-field">
+              <span>Username</span>
+              <Input
+                size="large"
+                value={loginState.username}
+                onChange={(event) => setLoginState((current) => ({ ...current, username: event.target.value }))}
+                placeholder="Enter username"
+                autoComplete="username"
+              />
+            </label>
+
+            <label className="auth-field">
+              <span>Password</span>
+              <Input.Password
+                size="large"
+                value={loginState.password}
+                onChange={(event) => setLoginState((current) => ({ ...current, password: event.target.value }))}
+                placeholder="Enter password"
+                autoComplete="current-password"
+              />
+            </label>
+
+            <Button type="primary" htmlType="submit" size="large" block loading={submitting}>
+              Sign in
+            </Button>
+          </form>
+
+          <Text type="secondary" className="auth-hint">
+            Demo note: this prototype expects the FastAPI backend at http://localhost:8000.
+          </Text>
+        </Card>
+      </div>
+    )
   }
 
   return (
@@ -259,7 +357,7 @@ function App() {
             <div className="brand-mark"><HeartOutlined /></div>
             {!collapsed && (
               <span className="brand-name">
-                <strong>CareGrid</strong>
+                <strong>TETHER</strong>
                 <small>HOSPITAL SYSTEM</small>
               </span>
             )}
@@ -273,7 +371,7 @@ function App() {
           </div>
           <Menu
             mode="inline"
-            items={navigation}
+            items={navigationItems}
             selectedKeys={[selectedKey]}
             onClick={({ key }) => setSelectedKey(key)}
             className="main-menu"
@@ -309,91 +407,62 @@ function App() {
               </Badge>
               <Dropdown menu={userMenu} trigger={['click']}>
                 <Button type="text" className="user-button">
-                  <Avatar size="small" className="user-avatar">AM</Avatar>
-                  <span className="user-name">Alex Morgan</span>
+                  <Avatar size="small" className="user-avatar">{authUser.username.slice(0, 2).toUpperCase()}</Avatar>
+                  <span className="user-name">{authUser.username}</span>
                 </Button>
               </Dropdown>
             </Space>
           </Header>
 
           <Content className="page-content">
-            <div className="page-heading">
-              <div>
-                <Text className="eyebrow">PATIENT ACCESS</Text>
-                <Title level={3}>{menuLabels.get(selectedKey) ?? 'Patient queue'}</Title>
-                <Text type="secondary">Review arrivals and follow each visit through the clinic.</Text>
-              </div>
-              <Space>
-                <Button icon={<CalendarOutlined />}>Appointments</Button>
-                <Button type="primary" icon={<PlusOutlined />}>Register patient</Button>
-              </Space>
-            </div>
-
-            <div className="summary-grid">
-              <Card className="summary-card">
-                <Statistic title="In today’s queue" value={28} prefix={<TeamOutlined />} />
-                <Text className="stat-footnote">Across 6 clinics</Text>
-              </Card>
-              <Card className="summary-card">
-                <Statistic title="Waiting for triage" value={8} prefix={<ClockCircleOutlined />} />
-                <Text className="stat-footnote">Median wait 12 min</Text>
-              </Card>
-              <Card className="summary-card">
-                <Statistic title="With care team" value={14} prefix={<HeartOutlined />} />
-                <Text className="stat-footnote">Nursing and doctor visits</Text>
-              </Card>
-              <Card className="summary-card">
-                <Statistic title="Completed today" value={6} prefix={<CheckCircleOutlined />} />
-                <Text className="stat-footnote">Updated just now</Text>
-              </Card>
-            </div>
-
-            <Card className="queue-card" styles={{ body: { padding: 0 } }}>
-              <div className="queue-toolbar">
-                <div>
-                  <Title level={5}>Live patient queue</Title>
-                  <Text type="secondary">Queue updates will appear here as visits progress.</Text>
-                </div>
-                <Space wrap>
-                  <Input
-                    allowClear
-                    prefix={<SearchOutlined />}
-                    placeholder="Search patient, number or clinic"
-                    value={query}
-                    onChange={(event) => setQuery(event.target.value)}
-                    className="queue-search"
-                  />
-                  <Select
-                    value={statusFilter}
-                    onChange={setStatusFilter}
-                    className="status-filter"
-                    options={[
-                      { value: 'all', label: 'All statuses' },
-                      { value: 'Queued', label: 'Queued' },
-                      { value: 'Triaged', label: 'Triaged' },
-                      { value: 'With nurse', label: 'With nurse' },
-                      { value: 'With doctor', label: 'With doctor' },
-                    ]}
-                  />
-                  <Button icon={<SearchOutlined />}>Filters</Button>
-                </Space>
-              </div>
-              <div className="queue-meta">
-                <Text type="secondary"><span className="live-dot" /> Live board</Text>
-                <Text type="secondary">Showing {filteredPatients.length} of 28 visits</Text>
-              </div>
-              <Table
-                columns={columns}
-                dataSource={filteredPatients}
-                pagination={{ pageSize: 15, showSizeChanger: false, showTotal: (total, range) => `${range[0]}–${range[1]} of ${total} visits` }}
-                scroll={{ x: 1120 }}
-                size="middle"
-                rowKey="key"
+            {selectedKey === 'settings' ? (
+              <AdminConsole
+                csrfToken={csrfToken}
+                currentUserId={authUser.id}
+                canManageUsers={hasPermission(authUser, ['identity.users.manage'])}
+                canManageRoles={authUser.is_system_owner || authUser.roles.includes('SuperAdmin')}
+                canViewAudit={hasPermission(authUser, [
+                  'quality-audit.read-only-audit-trail-and-transaction-reports.view',
+                ])}
+                onSessionRevoked={() => void handleLogout()}
               />
-            </Card>
-            <div className="demo-notice">
-              <Text type="secondary">Prototype workspace — all names and records shown are synthetic demo data.</Text>
-            </div>
+            ) : selectedKey === 'patient-queue' || selectedKey === 'patient-register' ? (
+              <PatientAccess
+                mode={selectedKey === 'patient-register' ? 'register' : 'queue'}
+                csrfToken={csrfToken}
+                canSearchPatients={hasPermission(authUser, [
+                  'front-office.search-existing-patient-records.view',
+                ])}
+                canCreatePatient={hasPermission(authUser, [
+                  'front-office.patient-registration-and-biodata.add',
+                ])}
+                canEditPatient={hasPermission(authUser, [
+                  'front-office.patient-registration-and-biodata.edit',
+                ])}
+                canOpenVisit={hasPermission(authUser, ['front-office.open-outpatient-visit.add'])}
+                onShowRegister={() => setSelectedKey('patient-register')}
+                onOpenQueue={() => setSelectedKey('patient-queue')}
+              />
+            ) : (
+              <div className="module-placeholder">
+                <div className="page-heading">
+                  <div>
+                    <Text className="eyebrow">ROLE-BASED ACCESS</Text>
+                    <Title level={3}>{menuLabels.get(selectedKey) ?? 'No modules assigned'}</Title>
+                    <Text type="secondary">
+                      {selectedKey === 'no-access'
+                        ? 'No modules are assigned to your account. Contact a system administrator.'
+                        : 'You have access to this module, but its workflow is not implemented yet.'}
+                    </Text>
+                  </div>
+                </div>
+                <Alert
+                  showIcon
+                  type="info"
+                  title="Access is controlled by your assigned roles. This module will not display sample patient data."
+                />
+              </div>
+            )}
           </Content>
         </Layout>
       </Layout>

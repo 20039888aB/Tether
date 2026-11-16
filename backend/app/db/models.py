@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -7,8 +7,10 @@ from sqlalchemy import (
     Boolean,
     CheckConstraint,
     Column,
+    Date,
     DateTime,
     ForeignKey,
+    Index,
     Integer,
     LargeBinary,
     String,
@@ -16,6 +18,7 @@ from sqlalchemy import (
     Text,
     Uuid,
     func,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
@@ -57,12 +60,23 @@ role_permissions = Table(
 
 class User(Base):
     __tablename__ = "users"
-    __table_args__ = (CheckConstraint("failed_login_attempts >= 0"),)
+    __table_args__ = (
+        CheckConstraint("failed_login_attempts >= 0"),
+        Index(
+            "uq_users_system_owner",
+            "is_system_owner",
+            unique=True,
+            sqlite_where=text("is_system_owner = 1"),
+            postgresql_where=text("is_system_owner"),
+        ),
+    )
 
     id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid4)
     username: Mapped[str] = mapped_column(String(128), unique=True, index=True)
     email: Mapped[str] = mapped_column(String(320), unique=True, index=True)
+    department: Mapped[str | None] = mapped_column(String(128))
     password_hash: Mapped[str] = mapped_column(Text)
+    is_system_owner: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, server_default="true")
     failed_login_attempts: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     locked_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -75,6 +89,11 @@ class User(Base):
         primaryjoin=lambda: User.id == user_roles.c.user_id,
         secondaryjoin=lambda: Role.id == user_roles.c.role_id,
         back_populates="users",
+    )
+    permission_overrides: Mapped[list["UserPermissionOverride"]] = relationship(
+        back_populates="user",
+        foreign_keys="UserPermissionOverride.user_id",
+        cascade="all, delete-orphan",
     )
 
 
@@ -105,6 +124,39 @@ class Permission(Base):
     roles: Mapped[list[Role]] = relationship(
         secondary=role_permissions, back_populates="permissions"
     )
+    user_overrides: Mapped[list["UserPermissionOverride"]] = relationship(
+        back_populates="permission",
+        cascade="all, delete-orphan",
+    )
+
+
+class UserPermissionOverride(Base):
+    __tablename__ = "user_permission_overrides"
+
+    user_id: Mapped[UUID] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    permission_id: Mapped[UUID] = mapped_column(
+        ForeignKey("permissions.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    is_granted: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+    updated_by: Mapped[UUID | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL")
+    )
+    user: Mapped[User] = relationship(
+        back_populates="permission_overrides",
+        foreign_keys=[user_id],
+    )
+    permission: Mapped[Permission] = relationship(
+        back_populates="user_overrides",
+    )
 
 
 class AuthSession(Base):
@@ -119,6 +171,56 @@ class AuthSession(Base):
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     user: Mapped[User] = relationship()
+
+
+class Patient(Base):
+    __tablename__ = "patients"
+    __table_args__ = (
+        CheckConstraint(
+            "sex_at_birth IS NULL OR sex_at_birth IN "
+            "('female', 'male', 'intersex', 'unknown')"
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid4)
+    patient_number: Mapped[str] = mapped_column(String(40), unique=True, index=True)
+    first_name: Mapped[str] = mapped_column(String(100))
+    middle_name: Mapped[str | None] = mapped_column(String(100))
+    last_name: Mapped[str] = mapped_column(String(100), index=True)
+    date_of_birth: Mapped[date | None] = mapped_column(Date)
+    sex_at_birth: Mapped[str | None] = mapped_column(String(16))
+    phone_number: Mapped[str | None] = mapped_column(String(32), index=True)
+    email: Mapped[str | None] = mapped_column(String(320))
+    address: Mapped[str | None] = mapped_column(String(500))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+    created_by: Mapped[UUID | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
+    updated_by: Mapped[UUID | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
+    outpatient_visits: Mapped[list["OutpatientVisit"]] = relationship(
+        back_populates="patient",
+    )
+
+
+class OutpatientVisit(Base):
+    __tablename__ = "outpatient_visits"
+    __table_args__ = (
+        CheckConstraint("status IN ('queued', 'cancelled', 'completed')"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid4)
+    patient_id: Mapped[UUID] = mapped_column(
+        ForeignKey("patients.id", ondelete="RESTRICT"),
+        index=True,
+    )
+    visit_number: Mapped[str] = mapped_column(String(40), unique=True, index=True)
+    clinic: Mapped[str] = mapped_column(String(128))
+    visit_type: Mapped[str] = mapped_column(String(64))
+    status: Mapped[str] = mapped_column(String(16), default="queued", server_default="queued")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    created_by: Mapped[UUID | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
+    patient: Mapped[Patient] = relationship(back_populates="outpatient_visits")
 
 
 class AuditLog(Base):

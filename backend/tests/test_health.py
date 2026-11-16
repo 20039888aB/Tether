@@ -1,3 +1,4 @@
+import pytest
 from fastapi.testclient import TestClient
 
 from app.main import app
@@ -10,7 +11,10 @@ def test_liveness_reports_running_process() -> None:
     assert response.json() == {"status": "ok"}
 
 
-def test_readiness_fails_explicitly_without_database_configuration() -> None:
+def test_readiness_fails_explicitly_without_database_configuration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HMS_DATABASE_URL", "")
     response = TestClient(app).get("/api/v1/health/ready")
 
     assert response.status_code == 503
