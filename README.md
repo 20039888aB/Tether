@@ -6,12 +6,12 @@ TETHER is being built as a modular-monolith hospital management system for priva
 
 - **Frontend:** React + TypeScript + Ant Design.
 - **Backend:** Python 3.13 + FastAPI.
-- **Primary datastore:** PostgreSQL 16+. It will be the authoritative store for patient, clinical, and financial records.
+- **Supported development and production datastore:** PostgreSQL 16+. It will be the authoritative store for patient, clinical, and financial records. The current local setup remains on SQLite until the PostgreSQL development service and migrations are established.
 - **Live updates:** WebSockets/SignalR-style events will be added behind authenticated APIs when a workflow needs them.
 - **Caching:** Redis is intentionally not part of the first slice; introduce it only for measured caching or coordination needs.
 - **Structure:** Modular monolith, with capability boundaries for identity, patient access, clinical care, inpatient, billing, inventory, workforce, and reporting.
 
-The current development slice includes session-based login, server-side permission checks, login lockout, SuperAdmin RBAC administration, and a persisted patient-registration and OPD-queue workflow. The SQLite development database is active. PostgreSQL migrations are provided but have not been applied or verified. The operational UI is still incomplete outside patient registration and OPD; clinical and financial audit coverage, MFA, and production hardening are not complete. Do not use real patient, staff, or payment data or expose this development system to a network.
+The current development slice includes session-based login, server-side permission checks, login lockout, SuperAdmin RBAC administration, and a persisted patient-registration and OPD-queue workflow. The SQLite development database is active. PostgreSQL 16+ is the supported database target, with SQLAlchemy's `asyncpg` driver declared as a required dependency; its migrations have not yet been applied or verified against a live server. The operational UI is still incomplete outside patient registration and OPD; clinical and financial audit coverage, MFA, and production hardening are not complete. Do not use real patient, staff, or payment data or expose this development system to a network.
 
 ## Run the frontend
 
@@ -38,7 +38,30 @@ py -m venv .venv
 
 ## Database
 
-`backend/migrations/001_core.sql` through `004_system_owner.sql` define the initial identity, RBAC overrides, patient, OPD, audit, and system-owner schemas. They are PostgreSQL migrations and have not been applied or tested against a running PostgreSQL server in this workspace. For SQLite development, `HMS_DATABASE_URL` is set in `backend/.env`; run `.\.venv\Scripts\python.exe -m app.bootstrap_roles` from `backend` to create/update the tables and seed the role catalog. A database with exactly one active SuperAdmin claims that account as owner; if multiple active SuperAdmins already exist, set `HMS_SYSTEM_OWNER_USERNAME` to the intended account for the one-time claim. On a new installation, run `.\.venv\Scripts\python.exe -m app.bootstrap_admin` after seeding to create the first administrator interactively; that account is the system owner. For PostgreSQL later, apply the migrations in order, then seed roles and bootstrap the administrator. Authentication and patient-access APIs are versioned under `/api/v1`.
+`backend/migrations/001_core.sql` through `004_system_owner.sql` define the initial identity, RBAC overrides, patient, OPD, audit, and system-owner schemas. They are PostgreSQL SQL migrations; a PostgreSQL connection URL must use the async driver format `postgresql+asyncpg://<user>:<password>@<host>:5432/<database>`. The SQLAlchemy models and PostgreSQL DDL compile for this dialect, but the migrations have not been applied or tested against a running PostgreSQL server in this workspace.
+
+The current local development database remains SQLite. `HMS_DATABASE_URL` is set in `backend/.env`; run `.\.venv\Scripts\python.exe -m app.bootstrap_roles` from `backend` to create/update the SQLite tables and seed the role catalog. A database with exactly one active SuperAdmin claims that account as owner; if multiple active SuperAdmins already exist, set `HMS_SYSTEM_OWNER_USERNAME` to the intended account for the one-time claim. On a new installation, run `.\.venv\Scripts\python.exe -m app.bootstrap_admin` after seeding to create the first administrator interactively; that account is the system owner.
+
+Do not switch the existing local database URL to PostgreSQL until the local PostgreSQL service and versioned migrations are configured and verified. No SQLite-to-PostgreSQL data migration is performed automatically. Authentication and patient-access APIs are versioned under `/api/v1`.
+
+### Local PostgreSQL service
+
+Docker Compose provides a local PostgreSQL 16 service, bound to loopback only, with a persistent named volume and a readiness health check. Add or update `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD`, and `POSTGRES_PORT` in the existing untracked `backend/.env`; set a unique local password and leave `HMS_DATABASE_URL` on SQLite for now. The variable names and non-secret defaults are shown in `backend/.env.example`.
+
+From the repository root, start and inspect the service with:
+
+```powershell
+docker compose --env-file backend/.env up -d postgres
+docker compose --env-file backend/.env ps
+```
+
+Stop it without deleting its data with:
+
+```powershell
+docker compose --env-file backend/.env stop postgres
+```
+
+The database files remain in the `tether_postgres_data` volume. Do not remove that volume unless you intend to permanently delete the local PostgreSQL data. This service does not migrate or connect the existing SQLite database; PostgreSQL schema setup remains for the migration task.
 
 ## User, role, and permission administration
 
