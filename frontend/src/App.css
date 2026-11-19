@@ -147,6 +147,10 @@
   background: #43a878;
 }
 
+.connection-dot-offline {
+  background: #c8463b;
+}
+
 .workspace {
   min-width: 0;
 }

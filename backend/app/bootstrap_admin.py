@@ -109,6 +109,9 @@ async def recover_system_owner(password: str, confirmation: str) -> None:
             owner.is_active = True
             owner.failed_login_attempts = 0
             owner.locked_until = None
+            owner.totp_secret_encrypted = None
+            owner.totp_pending_secret_encrypted = None
+            owner.totp_enabled_at = None
             await session.execute(
                 update(AuthSession)
                 .where(AuthSession.user_id == owner.id, AuthSession.revoked_at.is_(None))
@@ -121,14 +124,17 @@ async def recover_system_owner(password: str, confirmation: str) -> None:
                     resource_type="user",
                     resource_id=str(owner.id),
                     outcome="success",
-                    event_metadata={"recovery": True},
+                    event_metadata={"recovery": True, "mfa_reset": True},
                 )
             )
             await session.commit()
             username = owner.username
     finally:
         await engine.dispose()
-    print(f"System owner account '{username}' recovered; existing sessions were revoked.")
+    print(
+        f"System owner account '{username}' recovered; existing sessions were revoked. "
+        "Set up an authenticator again at the next sign-in."
+    )
 
 
 def main() -> None:
@@ -136,7 +142,7 @@ def main() -> None:
     parser.add_argument(
         "--recover-owner",
         action="store_true",
-        help="Reset the existing system owner's password and login lockout.",
+        help="Reset the owner's password, login lockout, and MFA enrollment.",
     )
     arguments = parser.parse_args()
     if arguments.recover_owner:

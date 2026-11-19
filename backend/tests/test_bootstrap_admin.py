@@ -34,6 +34,9 @@ def test_system_owner_recovery_restores_access_and_revokes_sessions(
                 is_active=False,
                 failed_login_attempts=5,
                 locked_until=datetime.now(UTC) + timedelta(minutes=15),
+                totp_secret_encrypted=b"encrypted-totp-secret",
+                totp_pending_secret_encrypted=b"pending-totp-secret",
+                totp_enabled_at=datetime.now(UTC),
                 roles=[],
             )
             session.add_all([owner, superadmin_role])
@@ -64,6 +67,9 @@ def test_system_owner_recovery_restores_access_and_revokes_sessions(
             assert owner.is_active is True
             assert owner.failed_login_attempts == 0
             assert owner.locked_until is None
+            assert owner.totp_secret_encrypted is None
+            assert owner.totp_pending_secret_encrypted is None
+            assert owner.totp_enabled_at is None
             assert any(role.name == "SuperAdmin" for role in owner.roles)
             assert PasswordHasher().verify(owner.password_hash, password)
 

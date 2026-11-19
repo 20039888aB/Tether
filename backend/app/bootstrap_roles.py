@@ -1,13 +1,20 @@
 import asyncio
 
-from sqlalchemy import inspect, select
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import async_sessionmaker
 from sqlalchemy.orm import selectinload
 
 from app.core.config import get_settings
 from app.core.rbac import ROLE_DESCRIPTIONS, default_role_permissions, permission_catalog
-from app.db.models import Base, Permission, Role, User
+from app.db.models import (
+    Permission,
+    Role,
+    User,
+    UserPermissionOverride,
+    role_permissions,
+)
 from app.db.session import get_engine
+from app.migrate_sqlite import migrate_sqlite
 
 LEGACY_ROLE_NAMES = {
     "Admin": "System Administrator",
@@ -32,32 +39,36 @@ async def seed_role_catalog() -> None:
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
     try:
         if engine.dialect.name == "sqlite":
-            async with engine.begin() as connection:
-                await connection.run_sync(Base.metadata.create_all)
-                user_columns = await connection.run_sync(
-                    lambda sync_connection: {
-                        column["name"]
-                        for column in inspect(sync_connection).get_columns("users")
-                    }
-                )
-                if "department" not in user_columns:
-                    await connection.exec_driver_sql(
-                        "ALTER TABLE users ADD COLUMN department VARCHAR(128)"
-                    )
-                if "is_system_owner" not in user_columns:
-                    await connection.exec_driver_sql(
-                        "ALTER TABLE users ADD COLUMN is_system_owner BOOLEAN NOT NULL DEFAULT 0"
-                    )
-                await connection.exec_driver_sql(
-                    "CREATE UNIQUE INDEX IF NOT EXISTS uq_users_system_owner "
-                    "ON users (is_system_owner) WHERE is_system_owner = 1"
-                )
+            await migrate_sqlite(engine)
         async with session_factory() as session:
             permissions = (await session.scalars(select(Permission))).all()
-            permission_by_key = {
+            catalog = permission_catalog()
+            all_permission_by_key = {
                 permission.permission_key: permission for permission in permissions
             }
-            catalog = permission_catalog()
+            permission_by_key = {
+                permission.permission_key: permission
+                for permission in permissions
+                if permission.permission_key in catalog
+            }
+            stale_permission_keys = set(all_permission_by_key) - set(catalog)
+            if stale_permission_keys:
+                stale_permission_ids = select(Permission.id).where(
+                    Permission.permission_key.in_(stale_permission_keys)
+                )
+                await session.execute(
+                    delete(UserPermissionOverride).where(
+                        UserPermissionOverride.permission_id.in_(stale_permission_ids)
+                    )
+                )
+                await session.execute(
+                    delete(role_permissions).where(
+                        role_permissions.c.permission_id.in_(stale_permission_ids)
+                    )
+                )
+                await session.execute(
+                    delete(Permission).where(Permission.permission_key.in_(stale_permission_keys))
+                )
             for key, description in catalog.items():
                 if key not in permission_by_key:
                     permission = Permission(permission_key=key, description=description)

@@ -5,8 +5,10 @@ from datetime import UTC, datetime, timedelta
 from typing import Annotated
 from uuid import UUID
 
+import pyotp
 from argon2 import PasswordHasher
 from argon2.exceptions import InvalidHashError, VerificationError, VerifyMismatchError
+from cryptography.fernet import Fernet, InvalidToken
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import func, select, update
@@ -16,7 +18,16 @@ from sqlalchemy.orm import selectinload
 
 from app.core.config import get_settings
 from app.core.rbac import permission_catalog, separation_of_duties_conflict
-from app.db.models import AuditLog, AuthSession, Permission, Role, User, UserPermissionOverride
+from app.core.system_events import attach_operation_event
+from app.db.models import (
+    AuditLog,
+    AuthSession,
+    Facility,
+    Permission,
+    Role,
+    User,
+    UserPermissionOverride,
+)
 from app.db.session import get_db
 
 logger = logging.getLogger(__name__)
@@ -29,6 +40,11 @@ DbSession = Annotated[AsyncSession, Depends(get_db)]
 class LoginRequest(BaseModel):
     username: str = Field(min_length=1, max_length=128)
     password: str = Field(min_length=1, max_length=1024)
+    totp_code: str | None = Field(default=None, min_length=6, max_length=6, pattern=r"^[0-9]{6}$")
+
+
+class MfaCodeRequest(BaseModel):
+    code: str = Field(min_length=6, max_length=6, pattern=r"^[0-9]{6}$")
 
 
 class UserCreateRequest(BaseModel):
@@ -36,6 +52,7 @@ class UserCreateRequest(BaseModel):
     email: str = Field(min_length=3, max_length=320)
     password: str = Field(min_length=14, max_length=1024)
     department: str | None = Field(default=None, max_length=128)
+    facility_id: int | None = Field(default=None, ge=1)
     role_ids: list[UUID] = Field(min_length=1)
 
     @field_validator("username", "email")
@@ -168,7 +185,7 @@ def _audit(
     event_metadata: dict[str, object] | None = None,
 ) -> AuditLog:
     user_agent = request.headers.get("user-agent")
-    return AuditLog(
+    audit_log = AuditLog(
         actor_user_id=actor_user_id,
         action=action,
         resource_type=resource_type,
@@ -178,6 +195,15 @@ def _audit(
         user_agent=user_agent[:1024] if user_agent else None,
         event_metadata=event_metadata or {},
     )
+    attach_operation_event(
+        audit_log,
+        action=action,
+        outcome=outcome,
+        actor_user_id=actor_user_id,
+        resource_id=resource_id,
+        resource_type=resource_type,
+    )
+    return audit_log
 
 
 def _check_csrf(request: Request, auth_session: AuthSession) -> None:
@@ -206,6 +232,62 @@ def _is_superadmin(user: User) -> bool:
     return user.is_system_owner or any(role.name == "SuperAdmin" for role in user.roles)
 
 
+def _effective_permission_keys(user: User) -> set[str]:
+    permissions = {
+        permission.permission_key
+        for role in user.roles
+        for permission in role.permissions
+    }
+    overrides = {
+        override.permission.permission_key: override.is_granted
+        for override in user.permission_overrides
+    }
+    permissions.update(key for key, is_granted in overrides.items() if is_granted)
+    permissions.difference_update(key for key, is_granted in overrides.items() if not is_granted)
+    return permissions
+
+
+def _requires_mfa(user: User) -> bool:
+    if _is_superadmin(user):
+        return True
+    return bool(
+        _effective_permission_keys(user)
+        & {"identity.users.manage", "identity.roles.manage"}
+    )
+
+
+def _mfa_cipher() -> Fernet:
+    key = get_settings().mfa_encryption_key
+    if not key:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="mfa_encryption_not_configured",
+        )
+    try:
+        return Fernet(key.encode("ascii"))
+    except (UnicodeEncodeError, ValueError) as error:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="mfa_encryption_key_invalid",
+        ) from error
+
+
+def _decrypt_mfa_secret(encrypted_secret: bytes) -> str:
+    try:
+        return _mfa_cipher().decrypt(encrypted_secret).decode("ascii")
+    except (InvalidToken, UnicodeDecodeError) as error:
+        logger.exception("Unable to decrypt a stored TOTP secret")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="mfa_secret_unavailable",
+        ) from error
+
+
+def _verify_totp(encrypted_secret: bytes, code: str) -> bool:
+    secret = _decrypt_mfa_secret(encrypted_secret)
+    return pyotp.TOTP(secret).verify(code, valid_window=1)
+
+
 def _user_payload(user: User) -> dict[str, object]:
     roles = {role.name for role in user.roles}
     if user.is_system_owner:
@@ -215,9 +297,12 @@ def _user_payload(user: User) -> dict[str, object]:
         "username": user.username,
         "email": user.email,
         "department": user.department,
+        "facility_id": user.facility_id,
         "roles": sorted(roles),
         "is_system_owner": user.is_system_owner,
         "is_active": user.is_active,
+        "mfa_enabled": user.totp_enabled_at is not None,
+        "mfa_required": _requires_mfa(user),
         "permission_overrides": {
             override.permission.permission_key: override.is_granted
             for override in user.permission_overrides
@@ -267,21 +352,13 @@ def require_permission(permission_key: str):
         if request.method not in {"GET", "HEAD", "OPTIONS"}:
             _check_csrf(request, auth_session)
 
-        permissions = {
-            permission.permission_key
-            for role in auth_session.user.roles
-            for permission in role.permissions
-        }
-        permission_overrides = {
-            override.permission.permission_key: override.is_granted
-            for override in auth_session.user.permission_overrides
-        }
-        permissions.update(
-            key for key, is_granted in permission_overrides.items() if is_granted
-        )
-        permissions.difference_update(
-            key for key, is_granted in permission_overrides.items() if not is_granted
-        )
+        if _requires_mfa(auth_session.user) and auth_session.user.totp_enabled_at is None:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="mfa_setup_required",
+            )
+
+        permissions = _effective_permission_keys(auth_session.user)
         if permission_key not in permissions and not _is_superadmin(auth_session.user):
             db.add(
                 _audit(
@@ -306,6 +383,11 @@ def require_superadmin():
     ) -> User:
         if request.method not in {"GET", "HEAD", "OPTIONS"}:
             _check_csrf(request, auth_session)
+        if _requires_mfa(auth_session.user) and auth_session.user.totp_enabled_at is None:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="mfa_setup_required",
+            )
         if not _is_superadmin(auth_session.user):
             db.add(
                 _audit(
@@ -332,7 +414,12 @@ async def login(
     settings = get_settings()
     statement = (
         select(User)
-        .options(selectinload(User.roles).selectinload(Role.permissions))
+        .options(
+            selectinload(User.roles).selectinload(Role.permissions),
+            selectinload(User.permission_overrides).selectinload(
+                UserPermissionOverride.permission
+            ),
+        )
         .where(User.username == credentials.username)
         .with_for_update()
     )
@@ -377,6 +464,14 @@ async def login(
         user.failed_login_attempts += 1
         if user.failed_login_attempts >= settings.login_lockout_attempts:
             user.locked_until = now + timedelta(minutes=settings.login_lockout_minutes)
+            await db.execute(
+                update(AuthSession)
+                .where(
+                    AuthSession.user_id == user.id,
+                    AuthSession.revoked_at.is_(None),
+                )
+                .values(revoked_at=now)
+            )
         db.add(
             _audit(
                 request,
@@ -388,6 +483,44 @@ async def login(
         )
         await db.commit()
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid_credentials")
+
+    if _requires_mfa(user) and user.totp_enabled_at is not None:
+        if credentials.totp_code is None:
+            db.add(
+                _audit(
+                    request,
+                    action="authentication.mfa.challenge",
+                    outcome="denied",
+                    actor_user_id=user.id,
+                    resource_id=user.username,
+                )
+            )
+            await db.commit()
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="mfa_code_required",
+            )
+        if (
+            user.totp_secret_encrypted is None
+            or not _verify_totp(user.totp_secret_encrypted, credentials.totp_code)
+        ):
+            user.failed_login_attempts += 1
+            if user.failed_login_attempts >= settings.login_lockout_attempts:
+                user.locked_until = now + timedelta(minutes=settings.login_lockout_minutes)
+            db.add(
+                _audit(
+                    request,
+                    action="authentication.mfa.verify",
+                    outcome="failure",
+                    actor_user_id=user.id,
+                    resource_id=user.username,
+                )
+            )
+            await db.commit()
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="invalid_mfa_code",
+            )
 
     user.failed_login_attempts = 0
     user.locked_until = None
@@ -450,17 +583,7 @@ async def current_user(
         override.permission.permission_key: override.is_granted
         for override in user.permission_overrides
     }
-    permissions = {
-        permission.permission_key
-        for role in user.roles
-        for permission in role.permissions
-    }
-    permissions.update(
-        key for key, is_granted in permission_overrides.items() if is_granted
-    )
-    permissions.difference_update(
-        key for key, is_granted in permission_overrides.items() if not is_granted
-    )
+    permissions = _effective_permission_keys(user)
     if _is_superadmin(user):
         permissions.update((await db.scalars(select(Permission.permission_key))).all())
     db.add(
@@ -486,7 +609,135 @@ async def current_user(
         "is_system_owner": user.is_system_owner,
         "permissions": sorted(permissions),
         "permission_overrides": permission_overrides,
+        "mfa_setup_required": _requires_mfa(user) and user.totp_enabled_at is None,
     }
+
+
+@router.post("/mfa/setup")
+async def start_mfa_setup(
+    request: Request,
+    db: DbSession,
+    auth_session: Annotated[AuthSession, Depends(get_auth_session)],
+) -> dict[str, str]:
+    user = auth_session.user
+    _check_csrf(request, auth_session)
+    if not _requires_mfa(user):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="mfa_not_required")
+    if user.totp_enabled_at is not None:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="mfa_already_enabled")
+
+    cipher = _mfa_cipher()
+    if user.totp_pending_secret_encrypted is None:
+        secret = pyotp.random_base32()
+        user.totp_pending_secret_encrypted = cipher.encrypt(secret.encode("ascii"))
+    else:
+        try:
+            secret = cipher.decrypt(user.totp_pending_secret_encrypted).decode("ascii")
+        except (InvalidToken, UnicodeDecodeError) as error:
+            logger.exception("Unable to decrypt a pending TOTP secret")
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="mfa_secret_unavailable",
+            ) from error
+
+    db.add(
+        _audit(
+            request,
+            action="identity.mfa.enrollment.started",
+            outcome="success",
+            actor_user_id=user.id,
+            resource_id=str(user.id),
+            resource_type="user",
+            event_metadata={"method": "totp"},
+        )
+    )
+    await db.commit()
+    return {
+        "secret": secret,
+        "provisioning_uri": pyotp.TOTP(secret).provisioning_uri(
+            name=user.email,
+            issuer_name="TETHER",
+        ),
+    }
+
+
+@router.post("/mfa/confirm")
+async def confirm_mfa_setup(
+    code_data: MfaCodeRequest,
+    request: Request,
+    db: DbSession,
+    auth_session: Annotated[AuthSession, Depends(get_auth_session)],
+) -> dict[str, bool]:
+    user = auth_session.user
+    _check_csrf(request, auth_session)
+    if not _requires_mfa(user):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="mfa_not_required")
+    if user.totp_enabled_at is not None:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="mfa_already_enabled")
+    if user.totp_pending_secret_encrypted is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="mfa_enrollment_not_started",
+        )
+    now = datetime.now(UTC)
+    if _is_locked(user, now):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="account_temporarily_locked",
+        )
+    if not _verify_totp(user.totp_pending_secret_encrypted, code_data.code):
+        user.failed_login_attempts += 1
+        if user.failed_login_attempts >= get_settings().login_lockout_attempts:
+            user.locked_until = now + timedelta(minutes=get_settings().login_lockout_minutes)
+            await db.execute(
+                update(AuthSession)
+                .where(
+                    AuthSession.user_id == user.id,
+                    AuthSession.revoked_at.is_(None),
+                )
+                .values(revoked_at=now)
+            )
+        db.add(
+            _audit(
+                request,
+                action="identity.mfa.enrollment.confirm",
+                outcome="failure",
+                actor_user_id=user.id,
+                resource_id=str(user.id),
+                resource_type="user",
+                event_metadata={"method": "totp"},
+            )
+        )
+        await db.commit()
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid_mfa_code")
+
+    user.totp_secret_encrypted = user.totp_pending_secret_encrypted
+    user.totp_pending_secret_encrypted = None
+    user.totp_enabled_at = now
+    user.failed_login_attempts = 0
+    user.locked_until = None
+    await db.execute(
+        update(AuthSession)
+        .where(
+            AuthSession.user_id == user.id,
+            AuthSession.id != auth_session.id,
+            AuthSession.revoked_at.is_(None),
+        )
+        .values(revoked_at=datetime.now(UTC))
+    )
+    db.add(
+        _audit(
+            request,
+            action="identity.mfa.enrollment.confirm",
+            outcome="success",
+            actor_user_id=user.id,
+            resource_id=str(user.id),
+            resource_type="user",
+            event_metadata={"method": "totp"},
+        )
+    )
+    await db.commit()
+    return {"mfa_enabled": True}
 
 
 @router.post("/logout", status_code=status.HTTP_204_NO_CONTENT)
@@ -523,7 +774,7 @@ async def list_users(
     statement = (
         select(User)
         .options(
-            selectinload(User.roles),
+            selectinload(User.roles).selectinload(Role.permissions),
             selectinload(User.permission_overrides).selectinload(
                 UserPermissionOverride.permission
             ),
@@ -1164,10 +1415,33 @@ async def create_user(
     }
     if not any(role.name == "SuperAdmin" for role in roles):
         _validate_role_permissions(role_permission_keys)
+    if _is_superadmin(current):
+        facility_id = user_data.facility_id
+        if facility_id is None and not any(role.name == "SuperAdmin" for role in roles):
+            facility_id = 1
+    else:
+        facility_id = current.facility_id or 1
+        if user_data.facility_id not in {None, facility_id}:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="facility_access_denied",
+            )
+    if facility_id is not None:
+        facility = await db.get(Facility, facility_id)
+        if facility is None and facility_id == 1:
+            facility = Facility(id=1, name="TETHER Development Facility", is_active=True)
+            db.add(facility)
+            await db.flush()
+        if facility is None or not facility.is_active:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="active_facility_required",
+            )
     user = User(
         username=user_data.username,
         email=user_data.email,
         department=user_data.department,
+        facility_id=facility_id,
         password_hash=password_hasher.hash(user_data.password),
         roles=roles,
         permission_overrides=[],
@@ -1210,7 +1484,7 @@ async def update_user(
     user = await db.scalar(
         select(User)
         .options(
-            selectinload(User.roles),
+            selectinload(User.roles).selectinload(Role.permissions),
             selectinload(User.permission_overrides).selectinload(
                 UserPermissionOverride.permission
             ),
@@ -1484,6 +1758,52 @@ async def reset_user_password(
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
+@router.post(
+    "/users/{user_id}/mfa/reset",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+async def reset_user_mfa(
+    user_id: UUID,
+    request: Request,
+    db: DbSession,
+    current: Annotated[User, Depends(require_superadmin())],
+) -> Response:
+    user = await db.scalar(select(User).where(User.id == user_id))
+    if user is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="user_not_found")
+    if user.id == current.id:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="cannot_reset_own_mfa")
+    if user.is_system_owner:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="system_owner_mfa_requires_trusted_host_recovery",
+        )
+    if user.totp_enabled_at is None:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="mfa_not_enabled")
+
+    user.totp_secret_encrypted = None
+    user.totp_pending_secret_encrypted = None
+    user.totp_enabled_at = None
+    await db.execute(
+        update(AuthSession)
+        .where(AuthSession.user_id == user.id, AuthSession.revoked_at.is_(None))
+        .values(revoked_at=datetime.now(UTC))
+    )
+    db.add(
+        _audit(
+            request,
+            action="identity.mfa.reset",
+            outcome="success",
+            actor_user_id=current.id,
+            resource_id=str(user.id),
+            resource_type="user",
+            event_metadata={"username": user.username, "reset_by": current.username},
+        )
+    )
+    await db.commit()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
 @router.patch("/users/{user_id}/status")
 async def set_user_status(
     user_id: UUID,
@@ -1495,7 +1815,7 @@ async def set_user_status(
     user = await db.scalar(
         select(User)
         .options(
-            selectinload(User.roles),
+            selectinload(User.roles).selectinload(Role.permissions),
             selectinload(User.permission_overrides).selectinload(
                 UserPermissionOverride.permission
             ),

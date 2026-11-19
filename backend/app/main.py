@@ -5,8 +5,10 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.auth import router as auth_router
+from app.api.clinic_management import router as clinic_management_router
 from app.api.health import router as health_router
 from app.api.patient_access import router as patient_access_router
+from app.api.system_sync import router as system_sync_router
 from app.core.config import get_settings
 from app.db.session import get_engine
 
@@ -41,3 +43,5 @@ app.add_middleware(
 app.include_router(health_router, prefix="/api/v1")
 app.include_router(auth_router, prefix="/api/v1")
 app.include_router(patient_access_router, prefix="/api/v1")
+app.include_router(clinic_management_router, prefix="/api/v1")
+app.include_router(system_sync_router, prefix="/api/v1")

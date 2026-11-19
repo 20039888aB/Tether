@@ -12,7 +12,12 @@ import {
   Typography,
 } from 'antd'
 import type { TableColumnsType } from 'antd'
-import { apiRequest } from './api'
+import {
+  apiRequest,
+  SYSTEM_DATA_CHANGED_EVENT,
+  SYSTEM_MANUAL_REFRESH_EVENT,
+} from './api'
+import type { SystemEvent } from './api'
 
 const { Text, Title } = Typography
 
@@ -27,6 +32,11 @@ type PatientRecord = {
   phone_number: string | null
   email: string | null
   address: string | null
+  next_of_kin_name: string | null
+  next_of_kin_phone: string | null
+  next_of_kin_relationship: string | null
+  next_of_kin_relationship_other: string | null
+  version: number
   created_at: string | null
   updated_at: string | null
 }
@@ -47,6 +57,7 @@ type VisitRecord = {
   clinic: string
   visit_type: string
   status: string
+  workflow_state: string
   created_at: string | null
 }
 
@@ -66,6 +77,10 @@ type PatientForm = {
   phone_number: string
   email: string
   address: string
+  next_of_kin_name: string
+  next_of_kin_phone: string
+  next_of_kin_relationship: string | null
+  next_of_kin_relationship_other: string
 }
 
 type PatientAccessProps = {
@@ -88,7 +103,46 @@ const EMPTY_FORM: PatientForm = {
   phone_number: '',
   email: '',
   address: '',
+  next_of_kin_name: '',
+  next_of_kin_phone: '',
+  next_of_kin_relationship: null,
+  next_of_kin_relationship_other: '',
 }
+
+const NEXT_OF_KIN_RELATIONSHIPS = [
+  { label: 'Spouse', value: 'spouse' },
+  { label: 'Partner', value: 'partner' },
+  { label: 'Parent', value: 'parent' },
+  { label: 'Mother', value: 'mother' },
+  { label: 'Father', value: 'father' },
+  { label: 'Child', value: 'child' },
+  { label: 'Son', value: 'son' },
+  { label: 'Daughter', value: 'daughter' },
+  { label: 'Sibling', value: 'sibling' },
+  { label: 'Brother', value: 'brother' },
+  { label: 'Sister', value: 'sister' },
+  { label: 'Grandparent', value: 'grandparent' },
+  { label: 'Grandmother', value: 'grandmother' },
+  { label: 'Grandfather', value: 'grandfather' },
+  { label: 'Grandchild', value: 'grandchild' },
+  { label: 'Aunt', value: 'aunt' },
+  { label: 'Uncle', value: 'uncle' },
+  { label: 'Niece', value: 'niece' },
+  { label: 'Nephew', value: 'nephew' },
+  { label: 'Cousin', value: 'cousin' },
+  { label: 'Step-parent', value: 'step_parent' },
+  { label: 'Step-child', value: 'step_child' },
+  { label: 'Parent-in-law', value: 'parent_in_law' },
+  { label: 'Child-in-law', value: 'child_in_law' },
+  { label: 'Sibling-in-law', value: 'sibling_in_law' },
+  { label: 'Guardian', value: 'guardian' },
+  { label: 'Legal guardian', value: 'legal_guardian' },
+  { label: 'Foster parent', value: 'foster_parent' },
+  { label: 'Caregiver', value: 'caregiver' },
+  { label: 'Friend', value: 'friend' },
+  { label: 'Neighbor', value: 'neighbor' },
+  { label: 'Other', value: 'other' },
+]
 
 function requestHeaders(csrfToken: string): HeadersInit {
   return {
@@ -170,11 +224,58 @@ function PatientAccess({
     else void loadVisits()
   }, [loadPatients, loadVisits, mode])
 
+  useEffect(() => {
+    const refreshVisibleData = () => {
+      if (mode === 'register') void loadPatients()
+      else void loadVisits()
+    }
+    const handleDataChanged = (event: Event) => {
+      if (!(event instanceof CustomEvent)) return
+      const changedEvents = event.detail as SystemEvent[]
+      const categories = new Set(changedEvents.map((change) => change.category))
+      const relevantCategories =
+        mode === 'register'
+          ? ['patient_access']
+          : ['patient_access', 'nursing', 'clinical']
+      if (relevantCategories.some((category) => categories.has(category))) {
+        refreshVisibleData()
+      }
+    }
+
+    window.addEventListener(SYSTEM_DATA_CHANGED_EVENT, handleDataChanged)
+    window.addEventListener(SYSTEM_MANUAL_REFRESH_EVENT, refreshVisibleData)
+    return () => {
+      window.removeEventListener(SYSTEM_DATA_CHANGED_EVENT, handleDataChanged)
+      window.removeEventListener(SYSTEM_MANUAL_REFRESH_EVENT, refreshVisibleData)
+    }
+  }, [loadPatients, loadVisits, mode])
+
   const savePatient = async () => {
     setError('')
     setSuccess('')
     if (!patientForm.first_name.trim() || !patientForm.last_name.trim()) {
       setError('First name and last name are required.')
+      return
+    }
+    const hasNextOfKinDetails = Boolean(
+      patientForm.next_of_kin_name.trim() ||
+      patientForm.next_of_kin_phone.trim() ||
+      patientForm.next_of_kin_relationship,
+    )
+    if (
+      hasNextOfKinDetails &&
+      (!patientForm.next_of_kin_name.trim() ||
+        !patientForm.next_of_kin_phone.trim() ||
+        !patientForm.next_of_kin_relationship)
+    ) {
+      setError('Enter the next-of-kin name, phone and relationship together.')
+      return
+    }
+    if (
+      patientForm.next_of_kin_relationship === 'other' &&
+      !patientForm.next_of_kin_relationship_other.trim()
+    ) {
+      setError('Specify the next-of-kin relationship when Other is selected.')
       return
     }
     setSaving(true)
@@ -188,6 +289,14 @@ function PatientAccess({
         phone_number: patientForm.phone_number.trim() || null,
         email: patientForm.email.trim() || null,
         address: patientForm.address.trim() || null,
+        next_of_kin_name: patientForm.next_of_kin_name.trim() || null,
+        next_of_kin_phone: patientForm.next_of_kin_phone.trim() || null,
+        next_of_kin_relationship: patientForm.next_of_kin_relationship,
+        next_of_kin_relationship_other:
+          patientForm.next_of_kin_relationship === 'other'
+            ? patientForm.next_of_kin_relationship_other.trim() || null
+            : null,
+        ...(editingPatient ? { version: editingPatient.version } : {}),
       }
       const result = await apiRequest<PatientRecord>(
         editingPatient ? `/patients/${editingPatient.id}` : '/patients',
@@ -281,6 +390,11 @@ function PatientAccess({
                   phone_number: patient.phone_number ?? '',
                   email: patient.email ?? '',
                   address: patient.address ?? '',
+                  next_of_kin_name: patient.next_of_kin_name ?? '',
+                  next_of_kin_phone: patient.next_of_kin_phone ?? '',
+                  next_of_kin_relationship: patient.next_of_kin_relationship,
+                  next_of_kin_relationship_other:
+                    patient.next_of_kin_relationship_other ?? '',
                 })
               }}
             >
@@ -328,7 +442,7 @@ function PatientAccess({
       title: 'STATUS',
       dataIndex: 'status',
       key: 'status',
-      render: (value: string) => <Tag color="gold">{value}</Tag>,
+      render: (_, visit) => <Tag color="gold">{visit.workflow_state.replaceAll('_', ' ')}</Tag>,
     },
   ]
 
@@ -402,6 +516,51 @@ function PatientAccess({
           setPatientForm((form) => ({ ...form, address: event.target.value }))
         }
       />
+      <Text strong style={{ gridColumn: '1 / -1' }}>Next of kin (optional)</Text>
+      <Input
+        aria-label="Next-of-kin name"
+        placeholder="Next-of-kin name"
+        value={patientForm.next_of_kin_name}
+        onChange={(event) =>
+          setPatientForm((form) => ({ ...form, next_of_kin_name: event.target.value }))
+        }
+      />
+      <Input
+        aria-label="Next-of-kin phone"
+        placeholder="Next-of-kin phone"
+        value={patientForm.next_of_kin_phone}
+        onChange={(event) =>
+          setPatientForm((form) => ({ ...form, next_of_kin_phone: event.target.value }))
+        }
+      />
+      <Select
+        aria-label="Next-of-kin relationship"
+        allowClear
+        placeholder="Next-of-kin relationship"
+        value={patientForm.next_of_kin_relationship}
+        onChange={(value) =>
+          setPatientForm((form) => ({
+            ...form,
+            next_of_kin_relationship: value ?? null,
+            next_of_kin_relationship_other:
+              value === 'other' ? form.next_of_kin_relationship_other : '',
+          }))
+        }
+        options={NEXT_OF_KIN_RELATIONSHIPS}
+      />
+      {patientForm.next_of_kin_relationship === 'other' && (
+        <Input
+          aria-label="Specify next-of-kin relationship"
+          placeholder="Specify relationship *"
+          value={patientForm.next_of_kin_relationship_other}
+          onChange={(event) =>
+            setPatientForm((form) => ({
+              ...form,
+              next_of_kin_relationship_other: event.target.value,
+            }))
+          }
+        />
+      )}
     </div>
   )
 

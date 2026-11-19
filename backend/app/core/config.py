@@ -7,6 +7,7 @@ class Settings(BaseSettings):
 
     database_url: str | None = None
     system_owner_username: str | None = None
+    mfa_encryption_key: str | None = None
     environment: str = "development"
     cors_origins: list[str] = ["http://localhost:5173"]
     session_cookie_name: str = "tether_session"

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 import {
   AppstoreOutlined,
@@ -13,6 +13,7 @@ import {
   MenuFoldOutlined,
   MenuUnfoldOutlined,
   SettingOutlined,
+  SyncOutlined,
   TeamOutlined,
   UserAddOutlined,
 } from '@ant-design/icons'
@@ -23,16 +24,31 @@ import {
   Button,
   Card,
   ConfigProvider,
+  Drawer,
   Dropdown,
+  Empty,
   Input,
   Layout,
+  List,
   Menu,
   Space,
+  Tooltip,
   Typography,
 } from 'antd'
 import type { MenuProps } from 'antd'
 import AdminConsole from './AdminConsole'
-import { apiRequest } from './api'
+import ClinicAdmin from './ClinicAdmin'
+import {
+  apiRequest,
+  MFA_SETUP_REQUIRED_EVENT,
+  SESSION_EXPIRED_EVENT,
+  SYSTEM_DATA_CHANGED_EVENT,
+  SYSTEM_MANUAL_REFRESH_EVENT,
+} from './api'
+import type { SystemEvent, SystemSyncResponse } from './api'
+import ClinicalWorkflow from './ClinicalWorkflow'
+import MfaSetup from './MfaSetup'
+import PatientRegisterDesktop from './PatientRegisterDesktop'
 import PatientAccess from './PatientAccess'
 import type { AuthUser } from './api'
 import './App.css'
@@ -40,6 +56,32 @@ import './App.css'
 const { Header, Sider, Content } = Layout
 const { Text, Title } = Typography
 const CSRF_COOKIE_NAME = import.meta.env.VITE_CSRF_COOKIE_NAME ?? 'tether_csrf'
+const SYNC_INTERVAL_MS = 2000
+const BACKGROUND_SYNC_INTERVAL_MS = 15000
+const MAX_SYNC_BACKOFF_MS = 30000
+
+function activityMessage(event: SystemEvent) {
+  const knownMessages: Record<string, string> = {
+    'patient.registration.create': 'A patient was registered.',
+    'patient.registration.update': 'A patient record was updated.',
+    'outpatient.visit.create': 'A patient joined the OPD queue.',
+    'nursing.triage.create': 'A nurse completed triage.',
+    'clinical.consultation.start': 'A doctor started a consultation.',
+    'clinical.consultation-note.create': 'A consultation draft was saved.',
+    'clinical.consultation-note.update': 'A consultation draft was updated.',
+    'clinical.consultation-note.sign': 'A consultation note was signed.',
+    'clinical.consultation-note.addendum': 'A consultation addendum was recorded.',
+    'clinical.consultation.complete': 'A consultation visit was completed.',
+  }
+  const knownMessage = knownMessages[event.action]
+  if (knownMessage) return knownMessage
+  if (event.action.toLowerCase().includes('dispens')) return 'Medication dispensing was recorded.'
+  if (event.action.toLowerCase().includes('payment')) return 'A payment operation was recorded.'
+  if (event.action.toLowerCase().includes('admission')) return 'An admission operation was recorded.'
+  if (event.action.toLowerCase().includes('laboratory')) return 'A laboratory operation was recorded.'
+  if (event.action.toLowerCase().includes('message')) return 'A message operation was recorded.'
+  return `${event.category.replaceAll('_', ' ')} activity was recorded.`
+}
 
 type NavigationLink = {
   key: string
@@ -92,6 +134,20 @@ const navigationSections: NavigationSection[] = [
       { key: 'reports', icon: <FileSearchOutlined />, label: 'Reports', permissions: ['medical-records.medical-statistics-and-records-reports.view', 'quality-audit.quality-indicators-and-incident-reports.view', 'quality-audit.read-only-audit-trail-and-transaction-reports.view'] },
     ],
   },
+  {
+    label: 'CONFIGURATION',
+    items: [
+      {
+        key: 'clinics',
+        icon: <SettingOutlined />,
+        label: 'Clinics',
+        permissions: [
+          'configuration.clinic-catalog.view',
+          'configuration.facility-clinics.view',
+        ],
+      },
+    ],
+  },
 ]
 
 const menuLabels = new Map<string, string>([
@@ -109,6 +165,7 @@ const menuLabels = new Map<string, string>([
   ['accounting', 'Accounting'],
   ['people', 'Staff & rosters'],
   ['reports', 'Reports'],
+  ['clinics', 'Clinic management'],
   ['settings', 'Administration & audit'],
 ])
 
@@ -169,20 +226,98 @@ function App() {
   const [authLoading, setAuthLoading] = useState(true)
   const [csrfToken, setCsrfToken] = useState('')
   const [loginError, setLoginError] = useState('')
-  const [loginState, setLoginState] = useState({ username: '', password: '' })
+  const [loginState, setLoginState] = useState({ username: '', password: '', totpCode: '' })
+  const [loginRequiresMfa, setLoginRequiresMfa] = useState(false)
   const [submitting, setSubmitting] = useState(false)
+  const [manualRefreshing, setManualRefreshing] = useState(false)
+  const [systemStatus, setSystemStatus] = useState<'checking' | 'ready' | 'offline'>('checking')
+  const [lastSync, setLastSync] = useState<string | null>(null)
+  const [syncError, setSyncError] = useState('')
+  const [activityEvents, setActivityEvents] = useState<SystemEvent[]>([])
+  const [unreadEvents, setUnreadEvents] = useState(0)
+  const [activityOpen, setActivityOpen] = useState(false)
+  const syncCursor = useRef<number | null>(null)
+  const syncInProgress = useRef(false)
+  const activeSyncUserId = useRef<string | null>(null)
+  const syncGeneration = useRef(0)
   const navigationItems = useMemo(
     () => (authUser ? buildNavigation(authUser) : []),
     [authUser],
   )
 
+  const resetSystemSync = useCallback(() => {
+    syncCursor.current = null
+    syncInProgress.current = false
+    activeSyncUserId.current = null
+    syncGeneration.current += 1
+    setManualRefreshing(false)
+    setSystemStatus('checking')
+    setLastSync(null)
+    setSyncError('')
+    setActivityEvents([])
+    setUnreadEvents(0)
+    setActivityOpen(false)
+  }, [])
+
+  const syncNow = useCallback(async (manual = false): Promise<boolean> => {
+    if (!authUser || authUser.mfa_setup_required || syncInProgress.current) return false
+    syncInProgress.current = true
+    const requestGeneration = syncGeneration.current
+    if (manual) setManualRefreshing(true)
+    try {
+      const path = syncCursor.current === null
+        ? '/system/sync'
+        : `/system/sync?after_id=${syncCursor.current}`
+      const result = await apiRequest<SystemSyncResponse>(path)
+      if (
+        requestGeneration !== syncGeneration.current ||
+        activeSyncUserId.current !== authUser.id
+      ) {
+        return false
+      }
+      const isInitialSync = syncCursor.current === null
+      syncCursor.current = result.cursor
+      setSystemStatus(result.status)
+      setLastSync(result.checked_at)
+      setSyncError('')
+      if (!isInitialSync && result.events.length > 0) {
+        setActivityEvents((current) => [...result.events, ...current].slice(0, 50))
+        setUnreadEvents((current) => current + result.events.length)
+        window.dispatchEvent(
+          new CustomEvent<SystemEvent[]>(SYSTEM_DATA_CHANGED_EVENT, {
+            detail: result.events,
+          }),
+        )
+      }
+      if (manual) window.dispatchEvent(new Event(SYSTEM_MANUAL_REFRESH_EVENT))
+      return true
+    } catch (error) {
+      if (
+        requestGeneration !== syncGeneration.current ||
+        activeSyncUserId.current !== authUser.id
+      ) {
+        return false
+      }
+      setSystemStatus('offline')
+      setSyncError(error instanceof Error ? error.message : 'System synchronization failed.')
+      return false
+    } finally {
+      if (requestGeneration === syncGeneration.current) {
+        syncInProgress.current = false
+        if (manual) setManualRefreshing(false)
+      }
+    }
+  }, [authUser])
+
   const loadCurrentUser = async () => {
     try {
       const user = await apiRequest<AuthUser>('/auth/me')
+      activeSyncUserId.current = user.id
       setAuthUser(user)
       setCsrfToken(readCsrfCookie())
       setLoginError('')
     } catch (error) {
+      activeSyncUserId.current = null
       setAuthUser(null)
       setCsrfToken('')
       setLoginError(
@@ -202,8 +337,67 @@ function App() {
   }, [])
 
   useEffect(() => {
+    const handleSessionExpired = () => {
+      if (!authUser) return
+      setAuthUser(null)
+      setCsrfToken('')
+      setLoginState({ username: '', password: '', totpCode: '' })
+      setLoginError('Your session expired or was revoked. Please sign in again.')
+      resetSystemSync()
+    }
+
+    window.addEventListener(SESSION_EXPIRED_EVENT, handleSessionExpired)
+    return () => window.removeEventListener(SESSION_EXPIRED_EVENT, handleSessionExpired)
+  }, [authUser, resetSystemSync])
+
+  useEffect(() => {
+    const handleMfaSetupRequired = () => {
+      setAuthUser((current) =>
+        current ? { ...current, mfa_setup_required: true } : current,
+      )
+      resetSystemSync()
+    }
+
+    window.addEventListener(MFA_SETUP_REQUIRED_EVENT, handleMfaSetupRequired)
+    return () => window.removeEventListener(MFA_SETUP_REQUIRED_EVENT, handleMfaSetupRequired)
+  }, [resetSystemSync])
+
+  useEffect(() => {
     void loadCurrentUser()
   }, [])
+
+  useEffect(() => {
+    if (!authUser || authUser.mfa_setup_required) return
+    let timer: number
+    let cancelled = false
+    let failureCount = 0
+
+    const poll = async () => {
+      if (cancelled) return
+      if (document.hidden) {
+        timer = window.setTimeout(poll, BACKGROUND_SYNC_INTERVAL_MS)
+        return
+      }
+      const succeeded = await syncNow()
+      failureCount = succeeded ? 0 : Math.min(failureCount + 1, 4)
+      const delay = Math.min(SYNC_INTERVAL_MS * 2 ** failureCount, MAX_SYNC_BACKOFF_MS)
+      if (!cancelled) timer = window.setTimeout(poll, delay)
+    }
+
+    const handleVisibilityChange = () => {
+      if (document.hidden) return
+      window.clearTimeout(timer)
+      timer = window.setTimeout(poll, 0)
+    }
+
+    timer = window.setTimeout(poll, 0)
+    document.addEventListener('visibilitychange', handleVisibilityChange)
+    return () => {
+      cancelled = true
+      window.clearTimeout(timer)
+      document.removeEventListener('visibilitychange', handleVisibilityChange)
+    }
+  }, [authUser, syncNow])
 
   useEffect(() => {
     if (authUser && !canOpenNavigationKey(authUser, selectedKey)) {
@@ -223,13 +417,26 @@ function App() {
         body: JSON.stringify({
           username: loginState.username,
           password: loginState.password,
+          totp_code: loginRequiresMfa ? loginState.totpCode : undefined,
         }),
       })
 
       setCsrfToken(response.csrf_token)
+      setLoginRequiresMfa(false)
+      setLoginState({ username: '', password: '', totpCode: '' })
       await loadCurrentUser()
     } catch (error) {
-      setLoginError(error instanceof Error ? error.message : 'Unable to sign in.')
+      const message = error instanceof Error ? error.message : 'Unable to sign in.'
+      if (message === 'mfa_code_required') {
+        setLoginRequiresMfa(true)
+        setLoginError('Enter the 6-digit code from your authenticator app.')
+      } else if (message === 'invalid_mfa_code') {
+        setLoginRequiresMfa(true)
+        setLoginState((current) => ({ ...current, totpCode: '' }))
+        setLoginError('That authenticator code is invalid or expired. Try the current code.')
+      } else {
+        setLoginError(message)
+      }
       setAuthUser(null)
     } finally {
       setSubmitting(false)
@@ -239,6 +446,7 @@ function App() {
   const handleLogout = async () => {
     if (!csrfToken) {
       setAuthUser(null)
+      resetSystemSync()
       return
     }
 
@@ -255,7 +463,8 @@ function App() {
     } finally {
       setAuthUser(null)
       setCsrfToken('')
-      setLoginState({ username: '', password: '' })
+      setLoginState({ username: '', password: '', totpCode: '' })
+      resetSystemSync()
     }
   }
 
@@ -317,6 +526,25 @@ function App() {
               />
             </label>
 
+            {loginRequiresMfa && (
+              <label className="auth-field">
+                <span>Authenticator code</span>
+                <Input
+                  size="large"
+                  value={loginState.totpCode}
+                  onChange={(event) =>
+                    setLoginState((current) => ({
+                      ...current,
+                      totpCode: event.target.value.replace(/[^0-9]/g, '').slice(0, 6),
+                    }))
+                  }
+                  placeholder="6-digit code"
+                  inputMode="numeric"
+                  autoComplete="one-time-code"
+                />
+              </label>
+            )}
+
             <Button type="primary" htmlType="submit" size="large" block loading={submitting}>
               Sign in
             </Button>
@@ -344,6 +572,9 @@ function App() {
         },
       }}
     >
+      {authUser.mfa_setup_required ? (
+        <MfaSetup csrfToken={csrfToken} onComplete={loadCurrentUser} />
+      ) : (
       <Layout className="app-layout">
         <Sider
           width={250}
@@ -378,9 +609,15 @@ function App() {
           />
           {!collapsed && (
             <div className="sider-footer">
-              <div className="connection-dot" />
+              <div className={`connection-dot ${systemStatus === 'offline' ? 'connection-dot-offline' : ''}`} />
               <span>System status</span>
-              <strong>Online</strong>
+              <strong>
+                {systemStatus === 'ready'
+                  ? 'Live'
+                  : systemStatus === 'offline'
+                    ? 'Offline'
+                    : 'Checking'}
+              </strong>
             </div>
           )}
         </Sider>
@@ -401,9 +638,38 @@ function App() {
               </div>
             </Space>
             <Space size={18}>
-              <Text className="header-date">Friday, 13 November 2026</Text>
-              <Badge count={3} size="small">
-                <Button type="text" shape="circle" icon={<BellOutlined />} aria-label="Notifications" />
+              <Tooltip title={syncError || (lastSync ? `Last checked ${new Date(lastSync).toLocaleTimeString()}` : 'Checking API and database status')}>
+                <Badge
+                  status={
+                    systemStatus === 'ready'
+                      ? 'success'
+                      : systemStatus === 'offline'
+                        ? 'error'
+                        : 'processing'
+                  }
+                  text={systemStatus === 'ready' ? 'Live' : systemStatus === 'offline' ? 'Offline' : 'Checking'}
+                />
+              </Tooltip>
+              <Button
+                icon={<SyncOutlined />}
+                loading={manualRefreshing}
+                onClick={() => void syncNow(true)}
+                aria-label="Refresh system data"
+                title="Check system status and refresh data"
+              >
+                Refresh
+              </Button>
+              <Badge count={unreadEvents} size="small">
+                <Button
+                  type="text"
+                  shape="circle"
+                  icon={<BellOutlined />}
+                  aria-label="Recent activity"
+                  onClick={() => {
+                    setActivityOpen(true)
+                    setUnreadEvents(0)
+                  }}
+                />
               </Badge>
               <Dropdown menu={userMenu} trigger={['click']}>
                 <Button type="text" className="user-button">
@@ -426,9 +692,37 @@ function App() {
                 ])}
                 onSessionRevoked={() => void handleLogout()}
               />
-            ) : selectedKey === 'patient-queue' || selectedKey === 'patient-register' ? (
+            ) : selectedKey === 'clinics' ? (
+              <ClinicAdmin
+                csrfToken={csrfToken}
+                canManageCatalog={hasPermission(authUser, [
+                  'configuration.clinic-catalog.manage',
+                ])}
+                canManageFacility={hasPermission(authUser, [
+                  'configuration.facility-clinics.manage',
+                ])}
+              />
+            ) : selectedKey === 'patient-register' ? (
+              <PatientRegisterDesktop
+                csrfToken={csrfToken}
+                username={authUser.username}
+                canSearchPatients={hasPermission(authUser, [
+                  'front-office.search-existing-patient-records.view',
+                ])}
+                canCreatePatient={hasPermission(authUser, [
+                  'front-office.patient-registration-and-biodata.add',
+                ])}
+                canEditPatient={hasPermission(authUser, [
+                  'front-office.patient-registration-and-biodata.edit',
+                ])}
+                canOpenVisit={hasPermission(authUser, [
+                  'front-office.open-outpatient-visit.add',
+                ])}
+                onNavigate={setSelectedKey}
+              />
+            ) : selectedKey === 'patient-queue' ? (
               <PatientAccess
-                mode={selectedKey === 'patient-register' ? 'register' : 'queue'}
+                mode="queue"
                 csrfToken={csrfToken}
                 canSearchPatients={hasPermission(authUser, [
                   'front-office.search-existing-patient-records.view',
@@ -442,6 +736,12 @@ function App() {
                 canOpenVisit={hasPermission(authUser, ['front-office.open-outpatient-visit.add'])}
                 onShowRegister={() => setSelectedKey('patient-register')}
                 onOpenQueue={() => setSelectedKey('patient-queue')}
+              />
+            ) : selectedKey === 'nursing' || selectedKey === 'doctors' ? (
+              <ClinicalWorkflow
+                mode={selectedKey === 'nursing' ? 'nursing' : 'doctors'}
+                csrfToken={csrfToken}
+                currentUserId={authUser.id}
               />
             ) : (
               <div className="module-placeholder">
@@ -466,6 +766,34 @@ function App() {
           </Content>
         </Layout>
       </Layout>
+      )}
+      <Drawer
+        title="Recent activity"
+        open={activityOpen}
+        onClose={() => setActivityOpen(false)}
+        width={420}
+      >
+        {activityEvents.length === 0 ? (
+          <Empty description="No new activity yet." />
+        ) : (
+          <List
+            dataSource={activityEvents}
+            renderItem={(event) => (
+              <List.Item key={event.id}>
+                <Space orientation="vertical" size={2}>
+                  <Text>{activityMessage(event)}</Text>
+                  <Text type="secondary">
+                    {new Date(event.occurred_at).toLocaleString()}
+                  </Text>
+                </Space>
+              </List.Item>
+            )}
+          />
+        )}
+        <Text type="secondary">
+          Notices are permission-scoped and omit patient details, note contents and payment amounts.
+        </Text>
+      </Drawer>
     </ConfigProvider>
   )
 }

@@ -415,6 +415,12 @@ CORE_PERMISSIONS = {
     "identity.users.manage": "Create users, assign roles, and activate or deactivate accounts.",
     "identity.roles.read": "Read roles and the permission catalog.",
     "identity.roles.manage": "Create roles and assign permissions to roles.",
+    "configuration.clinic-catalog.view": "Read the global clinic and visit-type catalog.",
+    "configuration.clinic-catalog.manage": "Create and edit the global clinic catalog.",
+    "configuration.facility-clinics.view": "Read clinic availability for the assigned facility.",
+    "configuration.facility-clinics.manage": (
+        "Enable, disable, schedule availability, and assign doctors to facility clinics."
+    ),
 }
 
 SEPARATION_OF_DUTIES_RULES = {
@@ -463,8 +469,16 @@ def default_role_permissions() -> dict[str, set[str]]:
         for action in entry.actions:
             grants[entry.role].add(f"{_slug(entry.department)}.{_slug(entry.function)}.{action}")
     grants["System Administrator"].update(CORE_PERMISSIONS)
+    grants["System Administrator"].discard("configuration.clinic-catalog.view")
+    grants["System Administrator"].discard("configuration.clinic-catalog.manage")
     grants["System Administrator"].add(
         "quality-audit.read-only-audit-trail-and-transaction-reports.view"
+    )
+    grants["Hospital Administrator"].update(
+        {
+            "configuration.facility-clinics.view",
+            "configuration.facility-clinics.manage",
+        }
     )
     grants["SuperAdmin"] = set(permission_catalog())
     return grants

@@ -1,6 +1,9 @@
 import asyncio
+from datetime import UTC, datetime
 
+import pyotp
 import pytest
+from cryptography.fernet import Fernet
 from fastapi.testclient import TestClient
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
@@ -11,10 +14,16 @@ from app.db.session import get_db, get_engine
 from app.main import app
 
 TEST_PASSWORD = "This-is-a-test-password-2026!"
+TEST_MFA_KEY = Fernet.generate_key()
+TEST_TOTP_SECRETS = {
+    "root": pyotp.random_base32(),
+    "sysadmin": pyotp.random_base32(),
+}
 
 
 @pytest.fixture
-def client(tmp_path):
+def client(tmp_path, monkeypatch):
+    monkeypatch.setenv("HMS_MFA_ENCRYPTION_KEY", TEST_MFA_KEY.decode("ascii"))
     database_path = tmp_path / "auth-tests.sqlite"
     engine = create_async_engine(f"sqlite+aiosqlite:///{database_path}")
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
@@ -71,6 +80,29 @@ def client(tmp_path):
             )
             access_role = Role(name="Receptionist")
             access_role.permissions.extend([users_read_permission, *receptionist_permissions])
+            nurse_role = Role(
+                name="Nurse",
+                permissions=[
+                    Permission(permission_key=key, description=key)
+                    for key in (
+                        "nursing.triage-and-vital-signs.view",
+                        "nursing.triage-and-vital-signs.add",
+                        "nursing.triage-and-vital-signs.edit",
+                    )
+                ],
+            )
+            doctor_role = Role(
+                name="Doctor / Medical Officer",
+                permissions=[
+                    Permission(permission_key=key, description=key)
+                    for key in (
+                        "clinical.consultation-notes-and-examination.view",
+                        "clinical.consultation-notes-and-examination.add",
+                        "clinical.consultation-notes-and-examination.edit",
+                        "clinical.consultation-notes-and-examination.approve",
+                    )
+                ],
+            )
             cashier_role = Role(name="Cashier", permissions=[cashier_payment_permission])
             finance_manager_role = Role(
                 name="Finance Manager",
@@ -89,12 +121,22 @@ def client(tmp_path):
                         username="nurse",
                         email="nurse@example.test",
                         password_hash=password_hasher.hash(TEST_PASSWORD),
-                        roles=[Role(name="Nurse")],
+                        roles=[nurse_role],
+                    ),
+                    User(
+                        username="doctor",
+                        email="doctor@example.test",
+                        password_hash=password_hasher.hash(TEST_PASSWORD),
+                        roles=[doctor_role],
                     ),
                     User(
                         username="sysadmin",
                         email="sysadmin@example.test",
                         password_hash=password_hasher.hash(TEST_PASSWORD),
+                        totp_secret_encrypted=Fernet(TEST_MFA_KEY).encrypt(
+                            TEST_TOTP_SECRETS["sysadmin"].encode("ascii")
+                        ),
+                        totp_enabled_at=datetime.now(UTC),
                         roles=[system_admin_role],
                     ),
                     User(
@@ -102,6 +144,10 @@ def client(tmp_path):
                         email="root@example.test",
                         password_hash=password_hasher.hash(TEST_PASSWORD),
                         is_system_owner=True,
+                        totp_secret_encrypted=Fernet(TEST_MFA_KEY).encrypt(
+                            TEST_TOTP_SECRETS["root"].encode("ascii")
+                        ),
+                        totp_enabled_at=datetime.now(UTC),
                         roles=[Role(name="SuperAdmin")],
                     ),
                     User(
@@ -134,11 +180,46 @@ def client(tmp_path):
     asyncio.run(engine.dispose())
 
 
-def test_login_permission_check_and_csrf_protected_logout(client: TestClient) -> None:
-    login_response = client.post(
-        "/api/v1/auth/login",
-        json={"username": "reception", "password": TEST_PASSWORD},
+def login_credentials(username: str, password: str = TEST_PASSWORD) -> dict[str, str]:
+    credentials = {"username": username, "password": password}
+    if username in TEST_TOTP_SECRETS:
+        credentials["totp_code"] = pyotp.TOTP(TEST_TOTP_SECRETS[username]).now()
+    return credentials
+
+
+def login_as(client: TestClient, username: str, password: str = TEST_PASSWORD):
+    credentials = login_credentials(username, password)
+    return client.post("/api/v1/auth/login", json=credentials)
+
+
+def complete_mfa_enrollment(client: TestClient, csrf_token: str) -> str:
+    headers = {"X-CSRF-Token": csrf_token}
+    setup_response = client.post("/api/v1/auth/mfa/setup", headers=headers)
+    assert setup_response.status_code == 200
+    secret = setup_response.json()["secret"]
+    totp = pyotp.TOTP(secret)
+    invalid_code = next(
+        f"{candidate:06d}"
+        for candidate in range(100)
+        if not totp.verify(f"{candidate:06d}", valid_window=1)
     )
+    invalid_confirmation = client.post(
+        "/api/v1/auth/mfa/confirm",
+        headers=headers,
+        json={"code": invalid_code},
+    )
+    assert invalid_confirmation.status_code == 400
+    confirmation = client.post(
+        "/api/v1/auth/mfa/confirm",
+        headers=headers,
+        json={"code": totp.now()},
+    )
+    assert confirmation.status_code == 200
+    return secret
+
+
+def test_login_permission_check_and_csrf_protected_logout(client: TestClient) -> None:
+    login_response = login_as(client, "reception")
     assert login_response.status_code == 200
     csrf_token = login_response.json()["csrf_token"]
     assert "httponly" in login_response.headers["set-cookie"].lower()
@@ -149,7 +230,7 @@ def test_login_permission_check_and_csrf_protected_logout(client: TestClient) ->
 
     users_response = client.get("/api/v1/auth/users")
     assert users_response.status_code == 200
-    assert len(users_response.json()) == 5
+    assert len(users_response.json()) == 6
 
     denied_logout = client.post("/api/v1/auth/logout")
     assert denied_logout.status_code == 403
@@ -159,6 +240,90 @@ def test_login_permission_check_and_csrf_protected_logout(client: TestClient) ->
     )
     assert logout_response.status_code == 204
     assert client.get("/api/v1/auth/me").status_code == 401
+
+
+def test_privileged_login_requires_totp(client: TestClient) -> None:
+    totp = pyotp.TOTP(TEST_TOTP_SECRETS["root"])
+    invalid_code = next(
+        f"{candidate:06d}"
+        for candidate in range(100)
+        if not totp.verify(f"{candidate:06d}", valid_window=1)
+    )
+    missing_code = client.post(
+        "/api/v1/auth/login",
+        json={"username": "root", "password": TEST_PASSWORD},
+    )
+    assert missing_code.status_code == 401
+    assert missing_code.json() == {"detail": "mfa_code_required"}
+
+    invalid_code = client.post(
+        "/api/v1/auth/login",
+        json={
+            "username": "root",
+            "password": TEST_PASSWORD,
+            "totp_code": invalid_code,
+        },
+    )
+    assert invalid_code.status_code == 401
+    assert invalid_code.json() == {"detail": "invalid_mfa_code"}
+
+    valid_login = login_as(client, "root")
+    assert valid_login.status_code == 200
+    assert client.get("/api/v1/auth/me").json()["mfa_setup_required"] is False
+
+
+def test_privileged_account_must_enroll_before_using_protected_apis(
+    client: TestClient,
+) -> None:
+    settings = get_settings()
+    assert login_as(client, "sysadmin").status_code == 200
+    existing_admin_session = client.cookies.get(settings.session_cookie_name)
+    assert existing_admin_session is not None
+
+    client.cookies.clear()
+    root_login = login_as(client, "root")
+    headers = {"X-CSRF-Token": root_login.json()["csrf_token"]}
+    users = client.get("/api/v1/auth/users").json()
+    system_admin = next(user for user in users if user["username"] == "sysadmin")
+
+    reset_response = client.post(
+        f"/api/v1/auth/users/{system_admin['id']}/mfa/reset",
+        headers=headers,
+    )
+    assert reset_response.status_code == 204
+    audit_response = client.get("/api/v1/auth/audit-logs?limit=10&offset=0")
+    assert audit_response.status_code == 200
+    assert any(entry["action"] == "identity.mfa.reset" for entry in audit_response.json()["items"])
+
+    client.cookies.clear()
+    client.cookies.set(settings.session_cookie_name, existing_admin_session)
+    assert client.get("/api/v1/auth/me").status_code == 401
+
+    client.cookies.clear()
+    password_login = client.post(
+        "/api/v1/auth/login",
+        json={"username": "sysadmin", "password": TEST_PASSWORD},
+    )
+    assert password_login.status_code == 200
+    profile = client.get("/api/v1/auth/me")
+    assert profile.status_code == 200
+    assert profile.json()["mfa_setup_required"] is True
+    assert client.get("/api/v1/auth/users").json() == {"detail": "mfa_setup_required"}
+
+    secret = complete_mfa_enrollment(client, password_login.json()["csrf_token"])
+    assert client.get("/api/v1/auth/me").json()["mfa_setup_required"] is False
+    assert client.get("/api/v1/auth/users").status_code == 200
+
+    client.cookies.clear()
+    valid_mfa_login = client.post(
+        "/api/v1/auth/login",
+        json={
+            "username": "sysadmin",
+            "password": TEST_PASSWORD,
+            "totp_code": pyotp.TOTP(secret).now(),
+        },
+    )
+    assert valid_mfa_login.status_code == 200
 
 
 def test_settings_reload_when_environment_changes(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -209,6 +374,10 @@ def test_receptionist_registers_patient_updates_record_and_opens_opd_visit(
         "phone_number": "+254700123456",
         "email": "jamie@example.test",
         "address": "Synthetic test address",
+        "next_of_kin_name": "Casey Example",
+        "next_of_kin_phone": "+254700555111",
+        "next_of_kin_relationship": "other",
+        "next_of_kin_relationship_other": "Family elder",
     }
 
     create_response = client.post(
@@ -220,16 +389,32 @@ def test_receptionist_registers_patient_updates_record_and_opens_opd_visit(
     assert create_response.status_code == 201
     patient = create_response.json()
     assert patient["patient_number"].startswith("TTH-")
+    assert patient["version"] == 1
     assert patient["first_name"] == "Jamie"
+    assert patient["next_of_kin_relationship"] == "other"
+    assert patient["next_of_kin_relationship_other"] == "Family elder"
     assert client.get("/api/v1/patients?q=Jamie").json()["total"] == 1
 
     update_response = client.put(
         f"/api/v1/patients/{patient['id']}",
         headers=headers,
-        json={**patient_data, "address": "Updated synthetic address"},
+        json={
+            **patient_data,
+            "address": "Updated synthetic address",
+            "version": patient["version"],
+        },
     )
     assert update_response.status_code == 200
     assert update_response.json()["address"] == "Updated synthetic address"
+    assert update_response.json()["next_of_kin_name"] == "Casey Example"
+    assert update_response.json()["version"] == 2
+    stale_update = client.put(
+        f"/api/v1/patients/{patient['id']}",
+        headers=headers,
+        json={**patient_data, "address": "Stale synthetic address", "version": 1},
+    )
+    assert stale_update.status_code == 409
+    assert stale_update.json() == {"detail": "record_changed_refresh_before_saving"}
 
     visit_response = client.post(
         "/api/v1/outpatient-visits",
@@ -245,6 +430,7 @@ def test_receptionist_registers_patient_updates_record_and_opens_opd_visit(
     assert visit["patient_id"] == patient["id"]
     assert visit["patient_number"] == patient["patient_number"]
     assert visit["status"] == "queued"
+    assert visit["workflow_state"] == "awaiting_triage"
 
     queue_response = client.get("/api/v1/outpatient-visits?status=queued")
     assert queue_response.status_code == 200
@@ -260,10 +446,7 @@ def test_receptionist_registers_patient_updates_record_and_opens_opd_visit(
     assert duplicate_response.json() == {"detail": "possible_duplicate_patient"}
 
     client.cookies.clear()
-    root_login = client.post(
-        "/api/v1/auth/login",
-        json={"username": "root", "password": TEST_PASSWORD},
-    )
+    root_login = login_as(client, "root")
     assert root_login.status_code == 200
     assert client.get("/api/v1/patients").status_code == 200
     assert client.get("/api/v1/outpatient-visits").status_code == 200
@@ -273,6 +456,236 @@ def test_receptionist_registers_patient_updates_record_and_opens_opd_visit(
     assert "patient.registration.update" in actions
     assert "patient.record.read" in actions
     assert "outpatient.visit.create" in actions
+
+
+def test_nurse_triage_and_doctor_consultation_lifecycle(client: TestClient) -> None:
+    receptionist_login = login_as(client, "reception")
+    reception_headers = {"X-CSRF-Token": receptionist_login.json()["csrf_token"]}
+    patient_response = client.post(
+        "/api/v1/patients",
+        headers=reception_headers,
+        json={
+            "first_name": "Taylor",
+            "last_name": "Synthetic",
+            "next_of_kin_name": "Morgan Synthetic",
+            "next_of_kin_phone": "+254700555222",
+            "next_of_kin_relationship": "guardian",
+        },
+    )
+    assert patient_response.status_code == 201
+    patient = patient_response.json()
+    visit_response = client.post(
+        "/api/v1/outpatient-visits",
+        headers=reception_headers,
+        json={
+            "patient_id": patient["id"],
+            "clinic": "General practice",
+            "visit_type": "Consultation",
+        },
+    )
+    assert visit_response.status_code == 201
+    visit_id = visit_response.json()["id"]
+
+    client.cookies.clear()
+    nurse_login = login_as(client, "nurse")
+    nurse_headers = {"X-CSRF-Token": nurse_login.json()["csrf_token"]}
+    nurse_queue = client.get("/api/v1/nursing/triage-queue")
+    assert nurse_queue.status_code == 200
+    assert nurse_queue.json()["items"][0]["patient"]["next_of_kin_name"] == "Morgan Synthetic"
+    assert client.get("/api/v1/doctors/consultation-queue").status_code == 403
+
+    triage_response = client.post(
+        f"/api/v1/nursing/visits/{visit_id}/triage",
+        headers=nurse_headers,
+        json={
+            "blood_pressure_systolic": 118,
+            "blood_pressure_diastolic": 76,
+            "pulse_rate_bpm": 72,
+            "temperature_celsius": 36.7,
+            "respiratory_rate_bpm": 16,
+            "oxygen_saturation_percent": 98,
+            "weight_kg": 68.5,
+            "height_cm": 170,
+            "pain_score": 1,
+            "notes": "Synthetic triage note",
+        },
+    )
+    assert triage_response.status_code == 201
+    assert client.get("/api/v1/nursing/triage-queue").json()["total"] == 0
+    assert client.post(
+        f"/api/v1/nursing/visits/{visit_id}/triage",
+        headers=nurse_headers,
+        json={},
+    ).status_code == 409
+
+    client.cookies.clear()
+    doctor_login = login_as(client, "doctor")
+    doctor_headers = {"X-CSRF-Token": doctor_login.json()["csrf_token"]}
+    doctor_queue = client.get("/api/v1/doctors/consultation-queue")
+    assert doctor_queue.status_code == 200
+    doctor_visit = doctor_queue.json()["items"][0]
+    assert doctor_visit["triage"]["blood_pressure_systolic"] == 118
+
+    start_response = client.post(
+        f"/api/v1/doctors/visits/{visit_id}/start",
+        headers=doctor_headers,
+    )
+    assert start_response.status_code == 200
+    note_response = client.post(
+        f"/api/v1/doctors/visits/{visit_id}/notes",
+        headers=doctor_headers,
+        json={"body": "Initial synthetic consultation note"},
+    )
+    assert note_response.status_code == 201
+    note = note_response.json()
+    edit_response = client.put(
+        f"/api/v1/doctors/notes/{note['id']}",
+        headers=doctor_headers,
+        json={"body": "Updated synthetic consultation note", "version": note["version"]},
+    )
+    assert edit_response.status_code == 200
+    assert edit_response.json()["version"] == 2
+    stale_note_update = client.put(
+        f"/api/v1/doctors/notes/{note['id']}",
+        headers=doctor_headers,
+        json={"body": "Stale synthetic consultation note", "version": note["version"]},
+    )
+    assert stale_note_update.status_code == 409
+    sign_response = client.post(
+        f"/api/v1/doctors/notes/{note['id']}/sign",
+        headers=doctor_headers,
+        json={"version": edit_response.json()["version"]},
+    )
+    assert sign_response.status_code == 200
+    assert sign_response.json()["status"] == "signed"
+    assert client.put(
+        f"/api/v1/doctors/notes/{note['id']}",
+        headers=doctor_headers,
+        json={"body": "Attempt to change signed note", "version": 2},
+    ).status_code == 409
+
+    addendum_response = client.post(
+        f"/api/v1/doctors/notes/{note['id']}/addenda",
+        headers=doctor_headers,
+        json={"body": "Synthetic addendum"},
+    )
+    assert addendum_response.status_code == 201
+    addendum = addendum_response.json()
+    assert addendum["parent_note_id"] == note["id"]
+    assert client.post(
+        f"/api/v1/doctors/notes/{addendum['id']}/sign",
+        headers=doctor_headers,
+        json={"version": addendum["version"]},
+    ).json()["status"] == "signed"
+
+    complete_response = client.post(
+        f"/api/v1/doctors/visits/{visit_id}/complete",
+        headers=doctor_headers,
+    )
+    assert complete_response.status_code == 200
+    assert complete_response.json()["workflow_state"] == "completed"
+    assert client.get("/api/v1/doctors/consultation-queue").json()["total"] == 0
+    late_addendum_response = client.post(
+        f"/api/v1/doctors/notes/{note['id']}/addenda",
+        headers=doctor_headers,
+        json={"body": "Post-completion addendum"},
+    )
+    assert late_addendum_response.status_code == 201
+    late_addendum = late_addendum_response.json()
+    late_addendum_update = client.put(
+        f"/api/v1/doctors/notes/{late_addendum['id']}",
+        headers=doctor_headers,
+        json={"body": "Updated post-completion addendum", "version": late_addendum["version"]},
+    )
+    assert late_addendum_update.status_code == 200
+    assert client.put(
+        f"/api/v1/doctors/notes/{late_addendum['id']}",
+        headers=doctor_headers,
+        json={"body": "Updated post-completion addendum", "version": late_addendum["version"]},
+    ).status_code == 409
+    assert client.post(
+        f"/api/v1/doctors/notes/{late_addendum['id']}/sign",
+        headers=doctor_headers,
+        json={"version": late_addendum_update.json()["version"]},
+    ).json()["status"] == "signed"
+    completed_queue = client.get("/api/v1/doctors/consultation-queue?include_completed=true")
+    assert completed_queue.status_code == 200
+    assert any(
+        note["body"] == "Updated post-completion addendum" and note["status"] == "signed"
+        for note in completed_queue.json()["items"][0]["consultation_notes"]
+    )
+    sync_response = client.get("/api/v1/system/sync?after_id=0")
+    sync_actions = {event["action"] for event in sync_response.json()["events"]}
+    assert "outpatient.visit.create" in sync_actions
+    assert "nursing.triage.create" in sync_actions
+    assert "clinical.consultation-note.sign" in sync_actions
+    assert "clinical.consultation.complete" in sync_actions
+    assert "Initial synthetic consultation note" not in str(sync_response.json())
+
+    client.cookies.clear()
+    root_login = login_as(client, "root")
+    audit_response = client.get("/api/v1/auth/audit-logs?limit=100&offset=0")
+    actions = {entry["action"] for entry in audit_response.json()["items"]}
+    assert "nursing.triage.create" in actions
+    assert "clinical.consultation-note.sign" in actions
+    assert "clinical.consultation-note.addendum" in actions
+    assert "clinical.consultation.complete" in actions
+    assert root_login.status_code == 200
+
+
+def test_patient_requires_complete_next_of_kin_details(client: TestClient) -> None:
+    login_response = login_as(client, "reception")
+    headers = {"X-CSRF-Token": login_response.json()["csrf_token"]}
+    response = client.post(
+        "/api/v1/patients",
+        headers=headers,
+        json={
+            "first_name": "Jordan",
+            "last_name": "Synthetic",
+            "next_of_kin_name": "Casey Synthetic",
+        },
+    )
+    assert response.status_code == 422
+    other_without_description = client.post(
+        "/api/v1/patients",
+        headers=headers,
+        json={
+            "first_name": "Avery",
+            "last_name": "Synthetic",
+            "next_of_kin_name": "Casey Synthetic",
+            "next_of_kin_phone": "+254700555333",
+            "next_of_kin_relationship": "other",
+        },
+    )
+    assert other_without_description.status_code == 422
+
+
+def test_system_sync_returns_redacted_permission_scoped_activity(client: TestClient) -> None:
+    login_response = login_as(client, "reception")
+    headers = {"X-CSRF-Token": login_response.json()["csrf_token"]}
+    initial_sync = client.get("/api/v1/system/sync")
+    assert initial_sync.status_code == 200
+    assert initial_sync.json()["status"] == "ready"
+
+    patient_response = client.post(
+        "/api/v1/patients",
+        headers=headers,
+        json={"first_name": "Robin", "last_name": "Synthetic"},
+    )
+    assert patient_response.status_code == 201
+    changes = client.get(f"/api/v1/system/sync?after_id={initial_sync.json()['cursor']}")
+    assert changes.status_code == 200
+    event = changes.json()["events"][0]
+    assert event["category"] == "patient_access"
+    assert event["action"] == "patient.registration.create"
+    assert set(event) == {"id", "category", "action", "occurred_at"}
+    assert patient_response.json()["patient_number"] not in str(event)
+
+    client.cookies.clear()
+    assert login_as(client, "auditor").status_code == 200
+    auditor_sync = client.get("/api/v1/system/sync?after_id=0")
+    assert auditor_sync.status_code == 200
+    assert auditor_sync.json()["events"] == []
 
 
 def test_patient_and_opd_apis_reject_users_without_the_required_permission(
@@ -322,7 +735,7 @@ def test_superadmin_user_permission_overrides_are_immediate_and_precede_roles(
     client.cookies.clear()
     root_login = client.post(
         "/api/v1/auth/login",
-        json={"username": "root", "password": TEST_PASSWORD},
+        json=login_credentials("root"),
     )
     assert root_login.status_code == 200
     response = client.put(
@@ -352,7 +765,7 @@ def test_superadmin_user_permission_overrides_are_immediate_and_precede_roles(
     client.cookies.clear()
     system_admin = client.post(
         "/api/v1/auth/login",
-        json={"username": "sysadmin", "password": TEST_PASSWORD},
+        json=login_credentials("sysadmin"),
     )
     assert system_admin.status_code == 200
     denied_policy_update = client.put(
@@ -378,7 +791,7 @@ def test_admin_password_reset_revokes_sessions_and_rejects_superadmin(
     client.cookies.clear()
     admin_login = client.post(
         "/api/v1/auth/login",
-        json={"username": "sysadmin", "password": TEST_PASSWORD},
+        json=login_credentials("sysadmin"),
     )
     assert admin_login.status_code == 200
     admin_session_cookie = client.cookies.get(settings.session_cookie_name)
@@ -435,7 +848,7 @@ def test_user_cannot_have_cashier_and_refund_approver_permissions(
 ) -> None:
     admin_login = client.post(
         "/api/v1/auth/login",
-        json={"username": "root", "password": TEST_PASSWORD},
+        json=login_credentials("root"),
     )
     assert admin_login.status_code == 200
     headers = {"X-CSRF-Token": admin_login.json()["csrf_token"]}
@@ -527,7 +940,7 @@ def test_failed_logins_trigger_temporary_account_lockout(client: TestClient) -> 
 def test_superadmin_can_create_role_and_admin_can_manage_users(client: TestClient) -> None:
     login_response = client.post(
         "/api/v1/auth/login",
-        json={"username": "root", "password": TEST_PASSWORD},
+        json=login_credentials("root"),
     )
     assert login_response.status_code == 200
     csrf_token = login_response.json()["csrf_token"]
@@ -578,7 +991,7 @@ def test_superadmin_can_create_role_and_admin_can_manage_users(client: TestClien
 
     admin_login = client.post(
         "/api/v1/auth/login",
-        json={"username": "root", "password": TEST_PASSWORD},
+        json=login_credentials("root"),
     )
     admin_headers = {"X-CSRF-Token": admin_login.json()["csrf_token"]}
     second_role_response = client.post(
@@ -595,7 +1008,7 @@ def test_superadmin_can_create_role_and_admin_can_manage_users(client: TestClien
     client.cookies.clear()
     system_admin_login = client.post(
         "/api/v1/auth/login",
-        json={"username": "sysadmin", "password": TEST_PASSWORD},
+        json=login_credentials("sysadmin"),
     )
     assert system_admin_login.status_code == 200
     admin_headers = {"X-CSRF-Token": system_admin_login.json()["csrf_token"]}
@@ -610,7 +1023,7 @@ def test_superadmin_can_create_role_and_admin_can_manage_users(client: TestClien
     client.cookies.clear()
     root_login = client.post(
         "/api/v1/auth/login",
-        json={"username": "root", "password": TEST_PASSWORD},
+        json=login_credentials("root"),
     )
     root_headers = {"X-CSRF-Token": root_login.json()["csrf_token"]}
     update_role_response = client.put(
@@ -641,7 +1054,7 @@ def test_superadmin_can_create_role_and_admin_can_manage_users(client: TestClien
 
     admin_login = client.post(
         "/api/v1/auth/login",
-        json={"username": "sysadmin", "password": TEST_PASSWORD},
+        json=login_credentials("sysadmin"),
     )
     deactivate_response = client.patch(
         f"/api/v1/auth/users/{user['id']}/status",
@@ -662,7 +1075,7 @@ def test_superadmin_has_full_access_and_only_superadmin_policy_changes(
 ) -> None:
     login_response = client.post(
         "/api/v1/auth/login",
-        json={"username": "root", "password": TEST_PASSWORD},
+        json=login_credentials("root"),
     )
     assert login_response.status_code == 200
     headers = {"X-CSRF-Token": login_response.json()["csrf_token"]}
@@ -708,7 +1121,7 @@ def test_superadmin_has_full_access_and_only_superadmin_policy_changes(
     client.cookies.clear()
     system_admin_login = client.post(
         "/api/v1/auth/login",
-        json={"username": "sysadmin", "password": TEST_PASSWORD},
+        json=login_credentials("sysadmin"),
     )
     system_admin_headers = {"X-CSRF-Token": system_admin_login.json()["csrf_token"]}
     assert client.post(
@@ -725,7 +1138,7 @@ def test_superadmin_has_full_access_and_only_superadmin_policy_changes(
     client.cookies.clear()
     login_response = client.post(
         "/api/v1/auth/login",
-        json={"username": "root", "password": TEST_PASSWORD},
+        json=login_credentials("root"),
     )
     headers = {"X-CSRF-Token": login_response.json()["csrf_token"]}
 
@@ -744,10 +1157,25 @@ def test_superadmin_has_full_access_and_only_superadmin_policy_changes(
     assert assigned_superadmin_response.json()["is_system_owner"] is False
 
     client.cookies.clear()
-    secondroot_login = client.post(
+    secondroot_password_login = client.post(
         "/api/v1/auth/login",
         json={"username": "secondroot", "password": "Initial-Staff-Password-2026!"},
     )
+    assert secondroot_password_login.status_code == 200
+    secondroot_secret = complete_mfa_enrollment(
+        client,
+        secondroot_password_login.json()["csrf_token"],
+    )
+    client.cookies.clear()
+    secondroot_login = client.post(
+        "/api/v1/auth/login",
+        json={
+            "username": "secondroot",
+            "password": "Initial-Staff-Password-2026!",
+            "totp_code": pyotp.TOTP(secondroot_secret).now(),
+        },
+    )
+    assert secondroot_login.status_code == 200
     secondroot_headers = {"X-CSRF-Token": secondroot_login.json()["csrf_token"]}
     assert client.get("/api/v1/auth/me").json()["is_system_owner"] is False
     assert client.put(
@@ -769,7 +1197,7 @@ def test_superadmin_has_full_access_and_only_superadmin_policy_changes(
     client.cookies.clear()
     owner_login = client.post(
         "/api/v1/auth/login",
-        json={"username": "root", "password": TEST_PASSWORD},
+        json=login_credentials("root"),
     )
     owner_headers = {"X-CSRF-Token": owner_login.json()["csrf_token"]}
     owner_profile = client.get("/api/v1/auth/me").json()
@@ -790,7 +1218,7 @@ def test_superadmin_has_full_access_and_only_superadmin_policy_changes(
 def test_superadmin_can_manage_custom_roles_and_permissions(client: TestClient) -> None:
     login_response = client.post(
         "/api/v1/auth/login",
-        json={"username": "root", "password": TEST_PASSWORD},
+        json=login_credentials("root"),
     )
     assert login_response.status_code == 200
     headers = {"X-CSRF-Token": login_response.json()["csrf_token"]}
@@ -848,7 +1276,7 @@ def test_superadmin_can_reset_own_password_and_session_is_revoked(
 ) -> None:
     login_response = client.post(
         "/api/v1/auth/login",
-        json={"username": "root", "password": TEST_PASSWORD},
+        json=login_credentials("root"),
     )
     assert login_response.status_code == 200
     root_id = client.get("/api/v1/auth/me").json()["id"]
@@ -864,5 +1292,5 @@ def test_superadmin_can_reset_own_password_and_session_is_revoked(
     assert client.get("/api/v1/auth/me").status_code == 401
     assert client.post(
         "/api/v1/auth/login",
-        json={"username": "root", "password": replacement_password},
+        json=login_credentials("root", replacement_password),
     ).status_code == 200

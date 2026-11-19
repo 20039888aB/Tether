@@ -17,7 +17,12 @@ import {
   Typography,
 } from 'antd'
 import type { TableColumnsType } from 'antd'
-import { apiRequest } from './api'
+import {
+  apiRequest,
+  SYSTEM_DATA_CHANGED_EVENT,
+  SYSTEM_MANUAL_REFRESH_EVENT,
+} from './api'
+import type { SystemEvent } from './api'
 
 const { Text, Title } = Typography
 
@@ -27,6 +32,8 @@ type UserRecord = {
   email: string
   department: string | null
   is_system_owner: boolean
+  mfa_enabled: boolean
+  mfa_required: boolean
   roles: string[]
   is_active: boolean
   permission_overrides: Record<string, boolean>
@@ -158,6 +165,23 @@ function AdminConsole({
 
   useEffect(() => {
     void refresh()
+  }, [refresh])
+
+  useEffect(() => {
+    const handleDataChanged = (event: Event) => {
+      if (!(event instanceof CustomEvent)) return
+      const changedEvents = event.detail as SystemEvent[]
+      if (changedEvents.some((change) => change.category === 'identity')) {
+        void refresh()
+      }
+    }
+
+    window.addEventListener(SYSTEM_DATA_CHANGED_EVENT, handleDataChanged)
+    window.addEventListener(SYSTEM_MANUAL_REFRESH_EVENT, refresh)
+    return () => {
+      window.removeEventListener(SYSTEM_DATA_CHANGED_EVENT, handleDataChanged)
+      window.removeEventListener(SYSTEM_MANUAL_REFRESH_EVENT, refresh)
+    }
   }, [refresh])
 
   const loadAuditPage = async (offset: number) => {
@@ -518,6 +542,24 @@ function AdminConsole({
     }
   }
 
+  const resetUserMfa = async (user: UserRecord) => {
+    setError('')
+    setSuccess('')
+    setSaving(true)
+    try {
+      await apiRequest<void>(`/auth/users/${user.id}/mfa/reset`, {
+        method: 'POST',
+        headers: requestHeaders(csrfToken),
+      })
+      setSuccess(`Authenticator reset for ${user.username}. They must set it up again at next sign-in.`)
+      await refresh()
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : 'Unable to reset the authenticator.')
+    } finally {
+      setSaving(false)
+    }
+  }
+
   const userColumns: TableColumnsType<UserRecord> = [
     { title: 'USERNAME', dataIndex: 'username', key: 'username' },
     { title: 'EMAIL', dataIndex: 'email', key: 'email' },
@@ -530,6 +572,8 @@ function AdminConsole({
         <Space size={4}>
           {names.map((name) => <Tag key={name}>{name}</Tag>)}
           {user.is_system_owner && <Tag color="gold">SYSTEM OWNER</Tag>}
+          {user.mfa_enabled && <Tag color="green">MFA enabled</Tag>}
+          {user.mfa_required && !user.mfa_enabled && <Tag color="orange">MFA setup required</Tag>}
         </Space>
       ),
     },
@@ -598,6 +642,17 @@ function AdminConsole({
           >
             Reset password
           </Button>
+          {canManageRoles && user.mfa_enabled && !user.is_system_owner && user.id !== currentUserId && (
+            <Popconfirm
+              title={`Reset authenticator for ${user.username}?`}
+              description="Their active sessions will be revoked and they must enroll again."
+              okText="Reset MFA"
+              cancelText="Cancel"
+              onConfirm={() => void resetUserMfa(user)}
+            >
+              <Button danger loading={saving}>Reset MFA</Button>
+            </Popconfirm>
+          )}
           {canManageRoles && (
             <Button
               disabled={user.is_system_owner}
